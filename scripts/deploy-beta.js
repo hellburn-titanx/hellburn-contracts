@@ -5,12 +5,12 @@
  * deploys to Sepolia, then restores originals.
  *
  * Timing:
- *   Genesis:  10 minutes total (2.5 min per "week")
- *   Vesting:  5 minutes
- *   Epochs:   3 minutes each
- *   Staking:  "days" become "minutes" (min 2 min, grace 2 min)
+ *   Genesis:  12 hours total (3h per "week")
+ *   Vesting:  6 hours
+ *   Epochs:   2 hours each
+ *   Staking:  "days" become "hours" (min 1h, grace 1h)
  *
- * Full test flow in ~30 minutes.
+ * Full test flow in ~24 hours.
  *
  * Usage: npx hardhat run scripts/deploy-beta.js --network sepolia
  */
@@ -36,30 +36,28 @@ const FILES = {
 // Each patch: [search, replace]
 const PATCHES = {
   genesis: [
-    // 28 days → 10 minutes genesis
-    ["GENESIS_DURATION = 28 days",  "GENESIS_DURATION = 10 minutes"],
-    // 28 days → 5 minutes vesting
-    ["VESTING_DURATION = 28 days",  "VESTING_DURATION = 5 minutes"],
-    // Weeks: 7 days → 150 seconds (2.5 min per "week", 4 weeks = 10 min)
-    ["elapsed / 7 days",            "elapsed / 150"],
+    // 28 days → 12 hours genesis
+    ["GENESIS_DURATION = 28 days",  "GENESIS_DURATION = 12 hours"],
+    // 28 days → 6 hours vesting
+    ["VESTING_DURATION = 28 days",  "VESTING_DURATION = 6 hours"],
+    // Weeks: 7 days → 3 hours (4 weeks × 3h = 12h)
+    ["elapsed / 7 days",            "elapsed / 10800"],
   ],
   epochs: [
-    // 8 days → 3 minutes per epoch
-    ["EPOCH_DURATION = 8 days",     "EPOCH_DURATION = 3 minutes"],
+    // 8 days → 2 hours per epoch
+    ["EPOCH_DURATION = 8 days",     "EPOCH_DURATION = 2 hours"],
   ],
   staking: [
-    // "days" in stake duration → minutes
-    // numDays * 1 days → numDays * 1 minutes
-    ["numDays * 1 days",            "numDays * 1 minutes"],
-    // Reading back: / 1 days → / 1 minutes
-    ["s.endTime - s.startTime) / 1 days", "s.endTime - s.startTime) / 1 minutes"],
-    // Min 28 days → 2 "minutes-as-days"
-    ["MIN_STAKE_DAYS = 28",         "MIN_STAKE_DAYS = 2"],
-    // Max 3500 → 60 (= 60 minutes = 1 hour max stake)
-    ["MAX_STAKE_DAYS = 3500",       "MAX_STAKE_DAYS = 60"],
-    // Grace period: 7 days → 2 minutes
-    ["GRACE_PERIOD = 7 days",       "GRACE_PERIOD = 2 minutes"],
-    // Max time bonus stays 3500 for formula, but adjust
+    // "days" in stake duration → hours
+    ["numDays * 1 days",            "numDays * 1 hours"],
+    // Reading back: / 1 days → / 1 hours
+    ["s.endTime - s.startTime) / 1 days", "s.endTime - s.startTime) / 1 hours"],
+    // Min 28 days → 1 "hour-as-day"
+    ["MIN_STAKE_DAYS = 28",         "MIN_STAKE_DAYS = 1"],
+    // Max 3500 → 24 (= 24 hours max stake)
+    ["MAX_STAKE_DAYS = 3500",       "MAX_STAKE_DAYS = 24"],
+    // Grace period: 7 days → 1 hour
+    ["GRACE_PERIOD = 7 days",       "GRACE_PERIOD = 1 hours"],
   ],
 };
 
@@ -142,13 +140,13 @@ async function main() {
   console.log("  ┌──────────────────┬──────────────┬──────────────┐");
   console.log("  │ Parameter        │ Mainnet      │ Beta         │");
   console.log("  ├──────────────────┼──────────────┼──────────────┤");
-  console.log("  │ Genesis Duration │ 28 days      │ 10 minutes   │");
-  console.log("  │ Genesis Weeks    │ 7 days each  │ 2.5 min each │");
-  console.log("  │ Vesting          │ 28 days      │ 5 minutes    │");
-  console.log("  │ Epoch Duration   │ 8 days       │ 3 minutes    │");
-  console.log("  │ Min Stake        │ 28 days      │ 2 minutes    │");
-  console.log("  │ Max Stake        │ 3500 days    │ 60 minutes   │");
-  console.log("  │ Grace Period     │ 7 days       │ 2 minutes    │");
+  console.log("  │ Genesis Duration │ 28 days      │ 12 hours     │");
+  console.log("  │ Genesis Weeks    │ 7 days each  │ 3 hours each │");
+  console.log("  │ Vesting          │ 28 days      │ 6 hours      │");
+  console.log("  │ Epoch Duration   │ 8 days       │ 2 hours      │");
+  console.log("  │ Min Stake        │ 28 days      │ 1 hour       │");
+  console.log("  │ Max Stake        │ 3500 days    │ 24 hours     │");
+  console.log("  │ Grace Period     │ 7 days       │ 1 hour       │");
   console.log("  └──────────────────┴──────────────┴──────────────┘\n");
 
   // ═══ PATCH ═══
@@ -206,7 +204,7 @@ async function main() {
     console.log(`        ✅ ${tokenDeployed}`);
 
     // 5. GenesisBurn
-    console.log("  [5/7] GenesisBurn (10 min duration)...");
+    console.log("  [5/7] GenesisBurn (12h duration)...");
     const GenesisBurn = await ethers.getContractFactory("GenesisBurn");
     const genesis = await GenesisBurn.deploy(
       titanXAddr, deployer.address, deployer.address, deployer.address, tokenDeployed
@@ -216,7 +214,7 @@ async function main() {
     console.log(`        ✅ ${genesisDeployed}`);
 
     // 6. Staking
-    console.log("  [6/7] HellBurnStaking (min 2 min)...");
+    console.log("  [6/7] HellBurnStaking (min 1h)...");
     const Staking = await ethers.getContractFactory("HellBurnStaking");
     const staking = await Staking.deploy(
       tokenDeployed, titanXAddr, dragonXAddr, deployer.address
@@ -227,8 +225,8 @@ async function main() {
 
     // 7. BurnEpochs
     const block = await ethers.provider.getBlock("latest");
-    const firstEpochStart = block.timestamp + 660; // starts after genesis (10 min + 1 min buffer)
-    console.log("  [7/7] BurnEpochs (3 min epochs)...");
+    const firstEpochStart = block.timestamp + 43500; // starts after genesis (12h + 5min buffer)
+    console.log("  [7/7] BurnEpochs (2h epochs)...");
     const BurnEpochs = await ethers.getContractFactory("BurnEpochs");
     const epochs = await BurnEpochs.deploy(
       titanXAddr, dragonXAddr, buyBurnDeployed, stakingDeployed,
@@ -259,13 +257,13 @@ async function main() {
       deployer: deployer.address,
       deployedAt: new Date().toISOString(),
       timing: {
-        genesis: "10 minutes",
-        vesting: "5 minutes",
-        weekDuration: "2.5 minutes",
-        epochDuration: "3 minutes",
-        minStake: "2 minutes",
-        maxStake: "60 minutes",
-        gracePeriod: "2 minutes",
+        genesis: "12 hours",
+        vesting: "6 hours",
+        weekDuration: "3 hours",
+        epochDuration: "2 hours",
+        minStake: "1 hour",
+        maxStake: "24 hours",
+        gracePeriod: "1 hour",
       },
       mockTokens: { titanX: titanXAddr, dragonX: dragonXAddr },
       contracts: {
@@ -290,20 +288,19 @@ async function main() {
     console.log(`  BuyAndBurn:      ${buyBurnDeployed}`);
     console.log("═══════════════════════════════════════════════════\n");
     console.log("  ⏱️  BETA TESTER FLOW:");
-    console.log("  ┌─────────┬──────────────────────────────────────┐");
-    console.log("  │  0:00   │ Mint TitanX/DragonX via Faucet       │");
-    console.log("  │  0:01   │ Genesis Burn → get HBURN (Week 1)    │");
-    console.log("  │  0:02   │ Claim vested HBURN (starts unlocking)│");
-    console.log("  │  0:05   │ All vesting complete                 │");
-    console.log("  │  0:10   │ Genesis ends automatically           │");
-    console.log("  │  0:11   │ Epoch 1 starts → burn for ETH        │");
-    console.log("  │  0:14   │ Epoch 1 ends → claim ETH rewards     │");
-    console.log("  │  0:14   │ Epoch 2 starts → streak = 2 (1.2x)   │");
-    console.log("  │  0:17   │ Epoch 2 ends → claim, streak grows   │");
-    console.log("  │  0:15   │ Stake HBURN (2 min minimum)          │");
-    console.log("  │  0:17   │ Unstake → check rewards & penalties  │");
-    console.log("  │  ~0:30  │ Full lifecycle tested!                │");
-    console.log("  └─────────┴──────────────────────────────────────┘\n");
+    console.log("  ┌──────────┬──────────────────────────────────────┐");
+    console.log("  │  0:00    │ Mint TitanX/DragonX via Faucet       │");
+    console.log("  │  0:01    │ Genesis Burn → get HBURN (Week 1)    │");
+    console.log("  │  3:00    │ Week 2 starts (bonus drops)          │");
+    console.log("  │  6:00    │ All vesting from hour-0 complete     │");
+    console.log("  │ 12:00    │ Genesis ends → call endGenesis()     │");
+    console.log("  │ 12:05    │ Epoch 1 starts → burn for ETH        │");
+    console.log("  │ 14:05    │ Epoch 1 ends → claim ETH rewards     │");
+    console.log("  │ 14:05    │ Epoch 2 starts → streak = 2 (1.2x)   │");
+    console.log("  │ anytime  │ Stake HBURN (1 hour minimum)         │");
+    console.log("  │ +1h      │ Unstake → check rewards & penalties  │");
+    console.log("  │ ~24h     │ Full lifecycle tested!                │");
+    console.log("  └──────────┴──────────────────────────────────────┘\n");
     console.log("  📋 NEXT STEPS:");
     console.log("  1. node scripts/sync-addresses.js");
     console.log("  2. cd ../hellburn-ui && npm run dev");
