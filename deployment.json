@@ -1,0 +1,22 @@
+{
+  "network": "sepolia",
+  "chainId": 11155111,
+  "deployer": "0x3f1B47be6c020bBb752BCfD5220DF51e3eE8b488",
+  "guardian": "0x3f1B47be6c020bBb752BCfD5220DF51e3eE8b488",
+  "timestamp": "2026-02-26T13:33:36.200Z",
+  "contracts": {
+    "HellBurnToken": "0x254448208aE46Ee70f88599F43A0FE44b2022254",
+    "GenesisBurn": "0x1516C4E774aE83C76586fcf58cdA2F21Bff0151b",
+    "BurnEpochs": "0xa8a61009C20761a344a465f8bEBbF6cC4FA7D4cf",
+    "HellBurnStaking": "0xf5723f735C866cD6EBCB5720A22f0ca56d02DFD7",
+    "BuyAndBurn": "0x7a46736Fbe138F48375dD7e404f02826548712E1"
+  },
+  "config": {
+    "firstEpochStart": 1772199204,
+    "firstEpochDate": "2026-02-27T13:33:24.000Z",
+    "titanX": "0xf19308f923582a6f7c465e5ce7a9dc1bec6665b1",
+    "dragonX": "0x96a5399D07896f757Bd4c6eF56461F58DB951862",
+    "genesisRecipient": "0x3f1B47be6c020bBb752BCfD5220DF51e3eE8b488",
+    "dragonXVault": "0x3f1B47be6c020bBb752BCfD5220DF51e3eE8b488"
+  }
+}

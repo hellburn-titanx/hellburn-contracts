@@ -1,0 +1,139 @@
+PS C:\_source\hellburn> npx hardhat run scripts/deploy.js --network sepolia
+═══════════════════════════════════════════════════
+  🔥 HELLBURN DEPLOYMENT v2 (post-audit)
+═══════════════════════════════════════════════════
+  Deployer:   0x3f1B47be6c020bBb752BCfD5220DF51e3eE8b488
+  Balance:    1.595512788282165881 ETH
+  Network:    sepolia (chainId: 11155111)
+═══════════════════════════════════════════════════
+
+  Roles:
+    Guardian (pause):    0x3f1B47be6c020bBb752BCfD5220DF51e3eE8b488
+    Genesis recipient:   0x3f1B47be6c020bBb752BCfD5220DF51e3eE8b488
+    DragonX vault:       0x3f1B47be6c020bBb752BCfD5220DF51e3eE8b488
+
+  Current nonce: 143
+  Pre-calculated addresses:
+    [0] BuyAndBurn:    0x7a46736Fbe138F48375dD7e404f02826548712E1
+    [1] HellBurnToken: 0x254448208aE46Ee70f88599F43A0FE44b2022254
+    [2] GenesisBurn:   0x1516C4E774aE83C76586fcf58cdA2F21Bff0151b
+    [3] Staking:       0xf5723f735C866cD6EBCB5720A22f0ca56d02DFD7
+    [4] BurnEpochs:    0xa8a61009C20761a344a465f8bEBbF6cC4FA7D4cf
+
+  [1/5] Deploying BuyAndBurn...
+        ✅ BuyAndBurn: 0x7a46736Fbe138F48375dD7e404f02826548712E1
+  [2/5] Deploying HellBurnToken...
+        ✅ HellBurnToken: 0x254448208aE46Ee70f88599F43A0FE44b2022254
+  [3/5] Deploying GenesisBurn...
+        ✅ GenesisBurn: 0x1516C4E774aE83C76586fcf58cdA2F21Bff0151b
+  [4/5] Deploying HellBurnStaking...
+        ✅ Staking: 0xf5723f735C866cD6EBCB5720A22f0ca56d02DFD7
+  [5/5] Deploying BurnEpochs...
+        ✅ BurnEpochs: 0xa8a61009C20761a344a465f8bEBbF6cC4FA7D4cf
+
+═══════════════════════════════════════════════════
+  🔥 DEPLOYMENT COMPLETE
+═══════════════════════════════════════════════════
+  HellBurnToken:   0x254448208aE46Ee70f88599F43A0FE44b2022254
+  GenesisBurn:     0x1516C4E774aE83C76586fcf58cdA2F21Bff0151b
+  BurnEpochs:      0xa8a61009C20761a344a465f8bEBbF6cC4FA7D4cf
+  HellBurnStaking: 0xf5723f735C866cD6EBCB5720A22f0ca56d02DFD7
+  BuyAndBurn:      0x7a46736Fbe138F48375dD7e404f02826548712E1
+  Guardian:        0x3f1B47be6c020bBb752BCfD5220DF51e3eE8b488
+  First Epoch:     2026-02-27T13:33:24.000Z
+═══════════════════════════════════════════════════
+
+  📄 Saved to deployment.json
+
+  📋 POST-DEPLOY CHECKLIST:
+     [ ] Verify all contracts on Etherscan
+     [ ] Create HBURN/WETH Uniswap V3 pool
+     [ ] Add initial liquidity
+     [ ] Test a small genesis burn
+     [ ] Announce genesis phase to community
+     [ ] Register on Immunefi (bug bounty)
+
+PS C:\_source\hellburn> npx hardhat verify --network sepolia 0x7a46736Fbe138F48375dD7e404f02826548712E1 0xE592427A0AEce92De3Edee1F18E0157C05861564 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2 0x254448208aE46Ee70f88599F43A0FE44b2022254
+[INFO] Sourcify Verification Skipped: Sourcify verification is currently disabled. To enable it, add the following entry to your Hardhat configuration:
+
+sourcify: {
+  enabled: true
+}
+
+Or set 'enabled' to false to hide this message.
+
+For more information, visit https://v2.hardhat.org/hardhat-runner/plugins/nomicfoundation-hardhat-verify#verifying-on-sourcify
+Successfully submitted source code for contract
+contracts/BuyAndBurn.sol:BuyAndBurn at 0x7a46736Fbe138F48375dD7e404f02826548712E1
+for verification on the block explorer. Waiting for verification result...
+
+Successfully verified contract BuyAndBurn on the block explorer.
+https://sepolia.etherscan.io/address/0x7a46736Fbe138F48375dD7e404f02826548712E1#code
+
+PS C:\_source\hellburn> npx hardhat verify --network sepolia 0x254448208aE46Ee70f88599F43A0FE44b2022254 0x1516C4E774aE83C76586fcf58cdA2F21Bff0151b 0xf5723f735C866cD6EBCB5720A22f0ca56d02DFD7 0x7a46736Fbe138F48375dD7e404f02826548712E1
+[INFO] Sourcify Verification Skipped: Sourcify verification is currently disabled. To enable it, add the following entry to your Hardhat configuration:
+
+sourcify: {
+  enabled: true
+}
+
+Or set 'enabled' to false to hide this message.
+
+For more information, visit https://v2.hardhat.org/hardhat-runner/plugins/nomicfoundation-hardhat-verify#verifying-on-sourcify
+Successfully submitted source code for contract
+contracts/HellBurnToken.sol:HellBurnToken at 0x254448208aE46Ee70f88599F43A0FE44b2022254
+for verification on the block explorer. Waiting for verification result...
+
+Successfully verified contract HellBurnToken on the block explorer.
+https://sepolia.etherscan.io/address/0x254448208aE46Ee70f88599F43A0FE44b2022254#code
+
+PS C:\_source\hellburn> npx hardhat verify --network sepolia 0x1516C4E774aE83C76586fcf58cdA2F21Bff0151b 0xf19308f923582a6f7c465e5ce7a9dc1bec6665b1 0x3f1B47be6c020bBb752BCfD5220DF51e3eE8b488 0xf5723f735C866cD6EBCB5720A22f0ca56d02DFD7 0x3f1B47be6c020bBb752BCfD5220DF51e3eE8b488 0x254448208aE46Ee70f88599F43A0FE44b2022254
+[INFO] Sourcify Verification Skipped: Sourcify verification is currently disabled. To enable it, add the following entry to your Hardhat configuration:
+
+sourcify: {
+  enabled: true
+}
+
+Or set 'enabled' to false to hide this message.
+
+For more information, visit https://v2.hardhat.org/hardhat-runner/plugins/nomicfoundation-hardhat-verify#verifying-on-sourcify
+Successfully submitted source code for contract
+contracts/GenesisBurn.sol:GenesisBurn at 0x1516C4E774aE83C76586fcf58cdA2F21Bff0151b
+for verification on the block explorer. Waiting for verification result...
+
+Successfully verified contract GenesisBurn on the block explorer.
+https://sepolia.etherscan.io/address/0x1516C4E774aE83C76586fcf58cdA2F21Bff0151b#code
+
+PS C:\_source\hellburn> npx hardhat verify --network sepolia 0xf5723f735C866cD6EBCB5720A22f0ca56d02DFD7 0x254448208aE46Ee70f88599F43A0FE44b2022254 0xf19308f923582a6f7c465e5ce7a9dc1bec6665b1 0x96a5399D07896f757Bd4c6eF56461F58DB951862 0x3f1B47be6c020bBb752BCfD5220DF51e3eE8b488
+[INFO] Sourcify Verification Skipped: Sourcify verification is currently disabled. To enable it, add the following entry to your Hardhat configuration:
+
+sourcify: {
+  enabled: true
+}
+
+Or set 'enabled' to false to hide this message.
+
+For more information, visit https://v2.hardhat.org/hardhat-runner/plugins/nomicfoundation-hardhat-verify#verifying-on-sourcify
+Successfully submitted source code for contract
+contracts/HellBurnStaking.sol:HellBurnStaking at 0xf5723f735C866cD6EBCB5720A22f0ca56d02DFD7
+for verification on the block explorer. Waiting for verification result...
+
+Successfully verified contract HellBurnStaking on the block explorer.
+https://sepolia.etherscan.io/address/0xf5723f735C866cD6EBCB5720A22f0ca56d02DFD7#code
+
+PS C:\_source\hellburn> npx hardhat verify --network sepolia 0xa8a61009C20761a344a465f8bEBbF6cC4FA7D4cf 0xf19308f923582a6f7c465e5ce7a9dc1bec6665b1 0x96a5399D07896f757Bd4c6eF56461F58DB951862 0x7a46736Fbe138F48375dD7e404f02826548712E1 0xf5723f735C866cD6EBCB5720A22f0ca56d02DFD7 1772285604 0x3f1B47be6c020bBb752BCfD5220DF51e3eE8b488
+[INFO] Sourcify Verification Skipped: Sourcify verification is currently disabled. To enable it, add the following entry to your Hardhat configuration:
+
+sourcify: {
+  enabled: true
+}
+
+Or set 'enabled' to false to hide this message.
+
+For more information, visit https://v2.hardhat.org/hardhat-runner/plugins/nomicfoundation-hardhat-verify#verifying-on-sourcify
+Successfully submitted source code for contract
+contracts/BurnEpochs.sol:BurnEpochs at 0xa8a61009C20761a344a465f8bEBbF6cC4FA7D4cf
+for verification on the block explorer. Waiting for verification result...
+
+Successfully verified contract BurnEpochs on the block explorer.
+https://sepolia.etherscan.io/address/0xa8a61009C20761a344a465f8bEBbF6cC4FA7D4cf#code

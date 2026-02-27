@@ -1,0 +1,5 @@
+{
+  "detectors_to_exclude": "naming-convention,pragma,solc-version",
+  "filter_paths": "node_modules,mocks",
+  "hardhat_ignore_compile": false
+}
