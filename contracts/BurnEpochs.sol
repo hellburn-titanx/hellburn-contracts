@@ -55,6 +55,9 @@ contract BurnEpochs is ReentrancyGuard, Pausable {
     // [C-01] Unallocated ETH from epochs with 0 burns
     uint256 public carryOverETH;
 
+    // Sequential finalization — prevents carryOverETH misallocation
+    uint256 public nextEpochToFinalize;
+
     // ─── User State ──────────────────────────────────────────────────
     struct UserStreak {
         uint256 lastParticipatedEpoch;
@@ -88,6 +91,7 @@ contract BurnEpochs is ReentrancyGuard, Pausable {
     error NoBurnsInEpoch();
     error TransferFailed();
     error OnlyGuardian();
+    error EpochOutOfOrder();
 
     // ─── Constructor ─────────────────────────────────────────────────
     constructor(
@@ -137,9 +141,13 @@ contract BurnEpochs is ReentrancyGuard, Pausable {
 
     // ─── Core: Finalize Epoch ────────────────────────────────────────
     function finalizeEpoch(uint256 epochId) external nonReentrant {
+        if (epochId != nextEpochToFinalize) revert EpochOutOfOrder();
         Epoch storage epoch = epochs[epochId];
         if (epoch.finalized) return;
         if (!_isEpochEnded(epochId)) revert EpochNotEnded();
+
+        // Advance pointer BEFORE state changes
+        nextEpochToFinalize = epochId + 1;
 
         // [C-01] Use per-epoch tracked ETH + carry-over
         uint256 epochETH = epoch.ethDeposited + carryOverETH;
@@ -167,6 +175,39 @@ contract BurnEpochs is ReentrancyGuard, Pausable {
         }
 
         emit EpochFinalized(epochId, epoch.ethRewards, epoch.totalWeightedBurns);
+    }
+
+    /// @notice Finalize all pending epochs up to (and including) `epochId` in one tx
+    function finalizeUpTo(uint256 epochId) external nonReentrant {
+        uint256 start = nextEpochToFinalize;
+        for (uint256 i = start; i <= epochId; i++) {
+            Epoch storage epoch = epochs[i];
+            if (!_isEpochEnded(i)) break;  // stop at first non-ended epoch
+            if (epoch.finalized) continue;
+
+            nextEpochToFinalize = i + 1;
+
+            uint256 epochETH = epoch.ethDeposited + carryOverETH;
+            carryOverETH = 0;
+            epoch.finalized = true;
+
+            if (epochETH > 0 && epoch.totalWeightedBurns > 0) {
+                uint256 rewardsForEpoch = (epochETH * REWARDS_PERCENT) / 100;
+                uint256 buyBurnAmount = epochETH - rewardsForEpoch;
+                epoch.ethRewards = rewardsForEpoch;
+                totalETHDistributed += epoch.ethRewards;
+
+                if (buyBurnAmount > 0) {
+                    (bool sent,) = buyAndBurn.call{value: buyBurnAmount}("");
+                    if (!sent) revert TransferFailed();
+                }
+            } else if (epochETH > 0) {
+                carryOverETH = epochETH;
+                emit OrphanedETHCarriedOver(i, epochETH);
+            }
+
+            emit EpochFinalized(i, epoch.ethRewards, epoch.totalWeightedBurns);
+        }
     }
 
     // ─── Core: Claim (NOT pausable — users can always withdraw) ─────
