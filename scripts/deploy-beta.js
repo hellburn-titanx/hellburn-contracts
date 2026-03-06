@@ -203,11 +203,20 @@ async function main() {
     const tokenDeployed = await token.getAddress();
     console.log(`        ✅ ${tokenDeployed}`);
 
-    // 5. GenesisBurn
-    console.log("  [5/7] GenesisBurn (12h duration)...");
+    // 5. GenesisBurn (Fair Launch: 8 params)
+    console.log("  [5/7] GenesisBurn (12h duration, Fair Launch)...");
     const GenesisBurn = await ethers.getContractFactory("GenesisBurn");
+    // On Sepolia: swapRouter, positionManager, weth use deployer as placeholder
+    // LP creation only works on mainnet with real Uniswap V3 contracts
     const genesis = await GenesisBurn.deploy(
-      titanXAddr, deployer.address, deployer.address, deployer.address, tokenDeployed
+      titanXAddr,           // _titanX
+      deployer.address,     // _dragonXVault
+      deployer.address,     // _treasury
+      tokenDeployed,        // _hburn
+      deployer.address,     // _swapRouter (placeholder on testnet)
+      deployer.address,     // _positionManager (placeholder on testnet)
+      deployer.address,     // _weth (placeholder on testnet)
+      3000                  // _titanXWethPoolFee (0.3%)
     );
     await genesis.waitForDeployment();
     const genesisDeployed = await genesis.getAddress();
@@ -245,7 +254,7 @@ async function main() {
     await verify("Mock DragonX", dragonXAddr, ["DragonX", "DRAGONX"]);
     await verify("BuyAndBurn", buyBurnDeployed, [deployer.address, deployer.address, tokenDeployed]);
     await verify("HellBurnToken", tokenDeployed, [genesisDeployed, stakingDeployed, buyBurnDeployed]);
-    await verify("GenesisBurn", genesisDeployed, [titanXAddr, deployer.address, deployer.address, deployer.address, tokenDeployed]);
+    await verify("GenesisBurn", genesisDeployed, [titanXAddr, deployer.address, deployer.address, tokenDeployed, deployer.address, deployer.address, deployer.address, 3000]);
     await verify("HellBurnStaking", stakingDeployed, [tokenDeployed, titanXAddr, dragonXAddr, deployer.address]);
     await verify("BurnEpochs", epochsDeployed, [titanXAddr, dragonXAddr, buyBurnDeployed, stakingDeployed, firstEpochStart, deployer.address]);
 
