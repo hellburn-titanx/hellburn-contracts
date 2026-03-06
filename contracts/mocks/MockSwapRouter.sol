@@ -21,6 +21,11 @@ contract MockWETH is ERC20 {
         require(sent, "ETH transfer failed");
     }
 
+    /// @notice Test helper: mint WETH without ETH backing
+    function mint(address to, uint256 amount) external {
+        _mint(to, amount);
+    }
+
     receive() external payable {
         _mint(msg.sender, msg.value);
     }
@@ -28,30 +33,50 @@ contract MockWETH is ERC20 {
 
 /**
  * @title MockSwapRouter
- * @notice Simulates Uniswap V3 swap by minting tokenOut at a fixed 1:1000 rate.
- *         Used only for testing BuyAndBurn.
+ * @notice Simulates Uniswap V3 swaps for testing.
+ *         Supports two swap directions:
+ *         - WETH → HBURN (for BuyAndBurn): mints HBURN at 1:1000 rate
+ *         - TitanX → WETH (for GenesisBurn Fair Launch): transfers pre-funded WETH at configurable rate
+ *
+ *         For TitanX→WETH: pre-fund this contract with WETH via MockWETH.mint()
  */
 contract MockSwapRouter {
-    uint256 public constant RATE = 1000; // 1 WETH = 1000 HBURN
+    uint256 public constant HBURN_RATE = 1000;    // 1 WETH = 1000 HBURN
+    uint256 public titanXToWethRate = 100000;      // 100000 TitanX = 1 WETH (configurable)
 
-    address public hburnToken;
+    address public weth;
 
-    constructor(address _hburn) {
-        hburnToken = _hburn;
+    constructor(address _weth) {
+        weth = _weth;
+    }
+
+    /// @notice Set the TitanX→WETH exchange rate for testing
+    function setTitanXRate(uint256 _rate) external {
+        titanXToWethRate = _rate;
     }
 
     function exactInputSingle(
         ISwapRouter.ExactInputSingleParams calldata params
     ) external payable returns (uint256 amountOut) {
-        // Pull WETH from caller
+        // Pull tokenIn from caller
         IERC20(params.tokenIn).transferFrom(msg.sender, address(this), params.amountIn);
 
-        // Calculate output (1 WETH = RATE HBURN)
-        amountOut = params.amountIn * RATE;
-        require(amountOut >= params.amountOutMinimum, "Slippage");
+        if (params.tokenOut == weth) {
+            // TitanX → WETH direction (for GenesisBurn)
+            amountOut = params.amountIn / titanXToWethRate;
+            require(amountOut >= params.amountOutMinimum, "Slippage");
 
-        // Mint HBURN to recipient (we need mintable mock)
-        MockMintable(params.tokenOut).mint(params.recipient, amountOut);
+            // Transfer WETH from our balance (must be pre-funded)
+            require(IERC20(weth).balanceOf(address(this)) >= amountOut, "MockRouter: insufficient WETH");
+            IERC20(weth).transfer(params.recipient, amountOut);
+        } else {
+            // WETH → HBURN direction (for BuyAndBurn)
+            amountOut = params.amountIn * HBURN_RATE;
+            require(amountOut >= params.amountOutMinimum, "Slippage");
+
+            // Mint HBURN to recipient
+            MockMintable(params.tokenOut).mint(params.recipient, amountOut);
+        }
     }
 }
 

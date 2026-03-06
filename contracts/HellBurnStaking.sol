@@ -215,18 +215,21 @@ contract HellBurnStaking is ReentrancyGuard, Pausable {
     }
 
     function getStakeInfo(uint256 stakeId) external view returns (
-        uint256 amount, uint256 shares, uint256 startTime,
-        uint256 endTime, uint256 fuelBonus, bool active,
-        uint256 maturityPct, uint256 pendingETH_
-    ) {
-        Stake storage s = stakes[stakeId];
-        return (
-            s.amount, s.shares, s.startTime, s.endTime,
-            s.fuelBonus, s.active,
-            _maturityPercent(s),
-            s.active ? _pendingETH(stakeId) : 0
-        );
-    }
+		uint256 amount, uint256 shares, uint256 startTime,
+		uint256 endTime, uint256 fuelBonus, bool active,
+		uint256 maturityPct, uint256 pendingETH_
+		) {
+			Stake storage s = stakes[stakeId];
+    
+		amount = s.amount;
+		shares = s.shares;
+		startTime = s.startTime;
+		endTime = s.endTime;
+		fuelBonus = s.fuelBonus;
+		active = s.active;
+		maturityPct = _maturityPercent(s);
+		pendingETH_ = s.active ? _pendingETH(stakeId) : 0;
+	}
 
     function pendingETHReward(uint256 stakeId) external view returns (uint256) {
         return _pendingETH(stakeId);

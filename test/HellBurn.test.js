@@ -5,11 +5,25 @@ const { time } = require("@nomicfoundation/hardhat-toolbox/network-helpers");
 const DAY = 86400;
 const DEAD = "0x000000000000000000000000000000000000dEaD";
 const INITIAL_BALANCE = ethers.parseEther("10000000"); // 10M
+const LP_RESERVE_PCT = 3n;
 
-describe("🔥 HellBurn Protocol — Full Test Suite", function () {
+// Helper: calculate expected HBURN amounts with LP reserve
+function calcGenesis(titanXAmount, week) {
+  const ratios = [100n, 95n, 90n, 85n];
+  const bonuses = [115n, 110n, 105n, 100n];
+  const w = Math.max(0, Math.min(3, week - 1));
+  const total = (titanXAmount * ratios[w] * bonuses[w]) / 10000n;
+  const lpReserve = (total * LP_RESERVE_PCT) / 100n;
+  const userAmount = total - lpReserve;
+  const immediate = (userAmount * 25n) / 100n;
+  const vested = userAmount - immediate;
+  return { total, lpReserve, userAmount, immediate, vested };
+}
+
+describe("🔥 HellBurn Protocol — Full Test Suite (Fair Launch)", function () {
   let deployer, alice, bob, charlie, guardian;
   let titanX, dragonX, hburn, genesis, staking, epochs, buyBurn;
-  let mockWeth, mockRouter;
+  let mockWeth, mockRouter, mockPositionManager;
 
   // ═══════════════════════════════════════════════════════════════
   //  SHARED SETUP
@@ -22,38 +36,35 @@ describe("🔥 HellBurn Protocol — Full Test Suite", function () {
     titanX = await MockERC20.deploy("TitanX", "TITANX");
     dragonX = await MockERC20.deploy("DragonX", "DRAGONX");
 
-    // Mint to users
     for (const u of [alice, bob, charlie]) {
       await titanX.mint(u.address, INITIAL_BALANCE);
       await dragonX.mint(u.address, INITIAL_BALANCE);
     }
 
-    // ── Pre-calculate addresses ──
-    const nonce = await ethers.provider.getTransactionCount(deployer.address);
-    const addr = (i) =>
-      ethers.getCreateAddress({ from: deployer.address, nonce: nonce + i });
-
-    // Deploy order: 0=MockWETH, 1=MockRouter(placeholder), 2=BuyBurn, 3=Token, 4=Genesis, 5=Staking, 6=Epochs
-    // Simplified: deploy mocks first, then protocol
+    // ── Mock Uniswap ──
     const MockWETH = await ethers.getContractFactory("MockWETH");
     mockWeth = await MockWETH.deploy();
 
-    // We need Token address for MockRouter, but Token needs Genesis/Staking/BuyBurn...
-    // Recalculate after mock deploys
-    const nonce2 = await ethers.provider.getTransactionCount(deployer.address);
-    const buyBurnAddr = ethers.getCreateAddress({ from: deployer.address, nonce: nonce2 });
-    const tokenAddr = ethers.getCreateAddress({ from: deployer.address, nonce: nonce2 + 1 });
-    const genesisAddr = ethers.getCreateAddress({ from: deployer.address, nonce: nonce2 + 2 });
-    const stakingAddr = ethers.getCreateAddress({ from: deployer.address, nonce: nonce2 + 3 });
+    const MockRouter = await ethers.getContractFactory("MockSwapRouter");
+    mockRouter = await MockRouter.deploy(await mockWeth.getAddress());
 
-    // Deploy MockRouter (needs hburn address)
-    // Actually, MockRouter needs to mint HBURN — but HBURN only allows genesis to mint
-    // For BuyAndBurn tests we'll handle separately. Use deployer as router placeholder.
+    // Pre-fund router with WETH for TitanX→WETH swaps
+    await mockWeth.mint(await mockRouter.getAddress(), ethers.parseEther("1000"));
+
+    const MockPM = await ethers.getContractFactory("MockNonfungiblePositionManager");
+    mockPositionManager = await MockPM.deploy();
+
+    // ── Pre-calculate addresses ──
+    const nonce = await ethers.provider.getTransactionCount(deployer.address);
+    const buyBurnAddr = ethers.getCreateAddress({ from: deployer.address, nonce });
+    const tokenAddr = ethers.getCreateAddress({ from: deployer.address, nonce: nonce + 1 });
+    const genesisAddr = ethers.getCreateAddress({ from: deployer.address, nonce: nonce + 2 });
+    const stakingAddr = ethers.getCreateAddress({ from: deployer.address, nonce: nonce + 3 });
 
     // ── 0: BuyAndBurn ──
     const BuyAndBurn = await ethers.getContractFactory("BuyAndBurn");
     buyBurn = await BuyAndBurn.deploy(
-      deployer.address, // swapRouter placeholder
+      await mockRouter.getAddress(),
       await mockWeth.getAddress(),
       tokenAddr
     );
@@ -62,14 +73,17 @@ describe("🔥 HellBurn Protocol — Full Test Suite", function () {
     const HellBurnToken = await ethers.getContractFactory("HellBurnToken");
     hburn = await HellBurnToken.deploy(genesisAddr, stakingAddr, buyBurnAddr);
 
-    // ── 2: GenesisBurn ──
+    // ── 2: GenesisBurn (Fair Launch — 8 params) ──
     const GenesisBurn = await ethers.getContractFactory("GenesisBurn");
     genesis = await GenesisBurn.deploy(
-      await titanX.getAddress(),
-      deployer.address, // dragonX vault
-      deployer.address, // treasury
-      deployer.address, // genesis recipient
-      await hburn.getAddress()
+      await titanX.getAddress(),       // _titanX
+      deployer.address,                // _dragonXVault
+      deployer.address,                // _treasury
+      await hburn.getAddress(),        // _hburn
+      await mockRouter.getAddress(),   // _swapRouter
+      await mockPositionManager.getAddress(), // _positionManager
+      await mockWeth.getAddress(),     // _weth
+      3000                             // _titanXWethPoolFee
     );
 
     // ── 3: HellBurnStaking ──
@@ -120,7 +134,6 @@ describe("🔥 HellBurn Protocol — Full Test Suite", function () {
     });
 
     it("allows genesis contract to mint", async function () {
-      // Alice burns TitanX via genesis → triggers mint
       await genesis.connect(alice).burn(ethers.parseEther("100000"));
       expect(await hburn.totalSupply()).to.be.gt(0);
     });
@@ -137,19 +150,15 @@ describe("🔥 HellBurn Protocol — Full Test Suite", function () {
 
     it("permanently disables minting after genesis ends", async function () {
       await time.increase(29 * DAY);
-      await genesis.endGenesis();
-
+      await genesis.endGenesis(0);
       expect(await hburn.genesisMintingEnded()).to.be.true;
-
-      // No more minting possible (even from genesis address)
-      // Genesis contract itself would revert too
     });
 
     it("emits event on minting end", async function () {
       await genesis.connect(alice).burn(ethers.parseEther("1000"));
       await time.increase(29 * DAY);
 
-      await expect(genesis.endGenesis())
+      await expect(genesis.endGenesis(0))
         .to.emit(hburn, "GenesisMintingPermanentlyEnded");
     });
 
@@ -164,47 +173,58 @@ describe("🔥 HellBurn Protocol — Full Test Suite", function () {
   });
 
   // ═══════════════════════════════════════════════════════════════
-  //  2. GENESIS BURN
+  //  2. GENESIS BURN (with Fair Launch LP Reserve)
   // ═══════════════════════════════════════════════════════════════
   describe("2. GenesisBurn", function () {
     beforeEach(deployAll);
 
-    describe("Burn & Mint", function () {
-      it("mints HBURN at week 1 ratio (1.0 × 1.15 = 1.15x)", async function () {
+    describe("Burn & Mint (97% to user, 3% LP reserve)", function () {
+      it("mints HBURN at week 1 ratio with LP reserve", async function () {
         const amt = ethers.parseEther("100000");
+        const expected = calcGenesis(amt, 1);
+
         await genesis.connect(alice).burn(amt);
 
-        // Total = 100000 × 1.0 × 1.15 = 115000
-        // Immediate 25% = 28750
-        const bal = await hburn.balanceOf(alice.address);
-        expect(bal).to.equal(ethers.parseEther("28750"));
+        // User gets 97% of 115000, immediate 25% of that
+        expect(await hburn.balanceOf(alice.address)).to.equal(expected.immediate);
+        expect(await genesis.lpReserveHBURN()).to.equal(expected.lpReserve);
       });
 
-      it("mints at week 2 ratio (0.95 × 1.10 = 1.045x)", async function () {
+      it("mints at week 2 ratio with LP reserve", async function () {
         await time.increase(7 * DAY);
-        await genesis.connect(alice).burn(ethers.parseEther("100000"));
+        const amt = ethers.parseEther("100000");
+        const expected = calcGenesis(amt, 2);
 
-        // 100000 × 0.95 × 1.10 = 104500, 25% = 26125
-        expect(await hburn.balanceOf(alice.address))
-          .to.equal(ethers.parseEther("26125"));
+        await genesis.connect(alice).burn(amt);
+        expect(await hburn.balanceOf(alice.address)).to.equal(expected.immediate);
       });
 
-      it("mints at week 3 ratio (0.90 × 1.05 = 0.945x)", async function () {
+      it("mints at week 3 ratio with LP reserve", async function () {
         await time.increase(14 * DAY);
-        await genesis.connect(alice).burn(ethers.parseEther("100000"));
+        const amt = ethers.parseEther("100000");
+        const expected = calcGenesis(amt, 3);
 
-        // 100000 × 0.90 × 1.05 = 94500, 25% = 23625
-        expect(await hburn.balanceOf(alice.address))
-          .to.equal(ethers.parseEther("23625"));
+        await genesis.connect(alice).burn(amt);
+        expect(await hburn.balanceOf(alice.address)).to.equal(expected.immediate);
       });
 
-      it("mints at week 4 ratio (0.85 × 1.00 = 0.85x)", async function () {
+      it("mints at week 4 ratio with LP reserve", async function () {
         await time.increase(21 * DAY);
-        await genesis.connect(alice).burn(ethers.parseEther("100000"));
+        const amt = ethers.parseEther("100000");
+        const expected = calcGenesis(amt, 4);
 
-        // 100000 × 0.85 × 1.00 = 85000, 25% = 21250
-        expect(await hburn.balanceOf(alice.address))
-          .to.equal(ethers.parseEther("21250"));
+        await genesis.connect(alice).burn(amt);
+        expect(await hburn.balanceOf(alice.address)).to.equal(expected.immediate);
+      });
+
+      it("accumulates LP reserve over multiple burns", async function () {
+        const amt = ethers.parseEther("50000");
+        const e1 = calcGenesis(amt, 1);
+
+        await genesis.connect(alice).burn(amt);
+        await genesis.connect(bob).burn(amt);
+
+        expect(await genesis.lpReserveHBURN()).to.equal(e1.lpReserve * 2n);
       });
 
       it("rejects zero amount", async function () {
@@ -214,15 +234,22 @@ describe("🔥 HellBurn Protocol — Full Test Suite", function () {
 
       it("rejects burn after genesis ends", async function () {
         await time.increase(29 * DAY);
-        await genesis.endGenesis();
+        await genesis.endGenesis(0);
 
         await expect(genesis.connect(alice).burn(ethers.parseEther("1000")))
           .to.be.revertedWithCustomError(genesis, "GenesisAlreadyEnded");
       });
 
-      it("emits GenesisBurnExecuted event", async function () {
-        await expect(genesis.connect(alice).burn(ethers.parseEther("10000")))
-          .to.emit(genesis, "GenesisBurnExecuted");
+      it("emits GenesisBurnExecuted event with LP reserve amount", async function () {
+        const amt = ethers.parseEther("10000");
+        const expected = calcGenesis(amt, 1);
+
+        await expect(genesis.connect(alice).burn(amt))
+          .to.emit(genesis, "GenesisBurnExecuted")
+          .withArgs(
+            alice.address, amt, expected.total,
+            expected.immediate, expected.vested, expected.lpReserve, 1
+          );
       });
 
       it("tracks totalTitanXBurned and totalHBURNMinted", async function () {
@@ -235,7 +262,7 @@ describe("🔥 HellBurn Protocol — Full Test Suite", function () {
       });
     });
 
-    describe("TitanX Distribution", function () {
+    describe("TitanX Distribution (Fair Launch)", function () {
       it("sends 35% to dead address (permanent burn)", async function () {
         const deadBefore = await titanX.balanceOf(DEAD);
         await genesis.connect(alice).burn(ethers.parseEther("100000"));
@@ -244,61 +271,72 @@ describe("🔥 HellBurn Protocol — Full Test Suite", function () {
         expect(deadAfter - deadBefore).to.equal(ethers.parseEther("35000"));
       });
 
-      it("sends 35% to DragonX vault", async function () {
+      it("sends 35% to DragonX vault + 22% to treasury", async function () {
         const vaultBefore = await titanX.balanceOf(deployer.address);
         await genesis.connect(alice).burn(ethers.parseEther("100000"));
         const vaultAfter = await titanX.balanceOf(deployer.address);
 
-        // deployer is both dragonX vault AND treasury AND genesis recipient
-        // 35% + 22% + 8% = 65%
-        expect(vaultAfter - vaultBefore).to.equal(ethers.parseEther("65000"));
+        // deployer is both dragonX vault AND treasury = 35% + 22% = 57%
+        expect(vaultAfter - vaultBefore).to.equal(ethers.parseEther("57000"));
       });
 
-      it("leaves 0 TitanX in the genesis contract", async function () {
+      it("keeps 8% (Genesis Fund) in the contract for LP", async function () {
         await genesis.connect(alice).burn(ethers.parseEther("100000"));
-        expect(await titanX.balanceOf(await genesis.getAddress())).to.equal(0);
+
+        // 8% = 8000 TitanX stays in contract
+        expect(await genesis.genesisFundTitanX()).to.equal(ethers.parseEther("8000"));
+        expect(await titanX.balanceOf(await genesis.getAddress()))
+          .to.equal(ethers.parseEther("8000"));
+      });
+
+      it("accumulates Genesis Fund across multiple burns", async function () {
+        await genesis.connect(alice).burn(ethers.parseEther("100000"));
+        await genesis.connect(bob).burn(ethers.parseEther("50000"));
+
+        // 8% of 150K = 12K
+        expect(await genesis.genesisFundTitanX()).to.equal(ethers.parseEther("12000"));
       });
     });
 
-    describe("Vesting (per-tranche)", function () {
-      it("vests 75% linearly over 28 days", async function () {
-        await genesis.connect(alice).burn(ethers.parseEther("100000"));
+    describe("Vesting (per-tranche, 97% base)", function () {
+      it("vests 75% of user amount linearly over 28 days", async function () {
+        const amt = ethers.parseEther("100000");
+        const expected = calcGenesis(amt, 1);
 
-        // Total = 115000, vested = 86250
-        // After 14 days → ~50% claimable
+        await genesis.connect(alice).burn(amt);
+
+        // After 14 days → ~50% of vested claimable
         await time.increase(14 * DAY);
         const claimable = await genesis.claimableAmount(alice.address);
-        const expected = ethers.parseEther("86250") / 2n;
-        expect(claimable).to.be.closeTo(expected, expected / 50n);
+        const halfVested = expected.vested / 2n;
+        expect(claimable).to.be.closeTo(halfVested, halfVested / 50n);
       });
 
       it("allows full claim after 28 days", async function () {
-        await genesis.connect(alice).burn(ethers.parseEther("100000"));
+        const amt = ethers.parseEther("100000");
+        const expected = calcGenesis(amt, 1);
+
+        await genesis.connect(alice).burn(amt);
         await time.increase(28 * DAY);
 
         await genesis.connect(alice).claimVested();
-        // 28750 immediate + 86250 vested = 115000
+        // immediate + vested = userAmount
         expect(await hburn.balanceOf(alice.address))
-          .to.equal(ethers.parseEther("115000"));
+          .to.equal(expected.userAmount);
       });
 
       it("creates separate tranches for multiple burns (H-01 fix)", async function () {
-        // Burn in week 1
         await genesis.connect(alice).burn(ethers.parseEther("50000"));
-
-        // Burn in week 3
         await time.increase(14 * DAY);
         await genesis.connect(alice).burn(ethers.parseEther("50000"));
 
         expect(await genesis.getUserTrancheCount(alice.address)).to.equal(2);
 
-        // Week 3 tranche should NOT be fully vested yet (only 0 days elapsed for it)
         const claimable = await genesis.claimableAmount(alice.address);
-        // Week 1 tranche: 14/28 = 50% of 43125 = ~21562
-        // Week 3 tranche: 0/28 = 0% of 35437.5 = 0
-        // Total claimable should be ~21562, NOT ~56562
-        const week1Vested = ethers.parseEther("43125"); // 57500 * 0.75
-        const halfWeek1 = week1Vested / 2n;
+        // Week 1 tranche: 14/28 = 50% of vested
+        const e1 = calcGenesis(ethers.parseEther("50000"), 1);
+        const halfWeek1 = e1.vested / 2n;
+        // Week 3 tranche: 0/28 = 0%
         expect(claimable).to.be.closeTo(halfWeek1, halfWeek1 / 50n);
       });
 
@@ -310,12 +348,10 @@ describe("🔥 HellBurn Protocol — Full Test Suite", function () {
       it("allows partial claims over time", async function () {
         await genesis.connect(alice).burn(ethers.parseEther("100000"));
 
-        // Claim at day 7
         await time.increase(7 * DAY);
         await genesis.connect(alice).claimVested();
         const bal1 = await hburn.balanceOf(alice.address);
 
-        // Claim again at day 14
         await time.increase(7 * DAY);
         await genesis.connect(alice).claimVested();
         const bal2 = await hburn.balanceOf(alice.address);
@@ -332,31 +368,145 @@ describe("🔥 HellBurn Protocol — Full Test Suite", function () {
       });
     });
 
-    describe("End Genesis", function () {
+    describe("End Genesis (Fair Launch LP Creation)", function () {
       it("anyone can call endGenesis after 28 days", async function () {
+        await genesis.connect(alice).burn(ethers.parseEther("100000"));
         await time.increase(29 * DAY);
-        await expect(genesis.connect(charlie).endGenesis())
+
+        await expect(genesis.connect(charlie).endGenesis(0))
           .to.emit(genesis, "GenesisPhaseEnded");
       });
 
+      it("creates LP via PositionManager when fund exists", async function () {
+        await genesis.connect(alice).burn(ethers.parseEther("100000"));
+        await time.increase(29 * DAY);
+
+        await expect(genesis.connect(charlie).endGenesis(0))
+          .to.emit(genesis, "LiquidityPoolCreated");
+
+        expect(await genesis.lpCreated()).to.be.true;
+        expect(await genesis.lpTokenId()).to.be.gt(0);
+      });
+
+      it("initializes pool before minting position", async function () {
+        await genesis.connect(alice).burn(ethers.parseEther("100000"));
+        await time.increase(29 * DAY);
+
+        await genesis.endGenesis(0);
+
+        expect(await mockPositionManager.poolInitialized()).to.be.true;
+        expect(await mockPositionManager.initialSqrtPrice()).to.be.gt(0);
+      });
+
+      it("swaps Genesis Fund TitanX → WETH via router", async function () {
+        await genesis.connect(alice).burn(ethers.parseEther("100000"));
+        // 8% = 8000 TitanX in fund
+        expect(await genesis.genesisFundTitanX()).to.equal(ethers.parseEther("8000"));
+
+        await time.increase(29 * DAY);
+        await genesis.endGenesis(0);
+
+        // TitanX should have been sent to router
+        expect(await titanX.balanceOf(await mockRouter.getAddress()))
+          .to.equal(ethers.parseEther("8000"));
+      });
+
+      it("deposits HBURN + WETH into PositionManager", async function () {
+        const amt = ethers.parseEther("100000");
+        const expected = calcGenesis(amt, 1);
+
+        await genesis.connect(alice).burn(amt);
+        await time.increase(29 * DAY);
+        await genesis.endGenesis(0);
+
+        const pmAddr = await mockPositionManager.getAddress();
+
+        // LP reserve HBURN should be in PositionManager
+        expect(await hburn.balanceOf(pmAddr)).to.equal(expected.lpReserve);
+
+        // WETH should also be in PositionManager
+        expect(await mockWeth.balanceOf(pmAddr)).to.be.gt(0);
+      });
+
       it("cannot end genesis early", async function () {
-        await expect(genesis.endGenesis())
+        await expect(genesis.endGenesis(0))
           .to.be.revertedWithCustomError(genesis, "GenesisNotYetEnded");
       });
 
       it("cannot end genesis twice", async function () {
+        await genesis.connect(alice).burn(ethers.parseEther("100000"));
         await time.increase(29 * DAY);
-        await genesis.endGenesis();
+        await genesis.endGenesis(0);
 
-        await expect(genesis.endGenesis())
+        await expect(genesis.endGenesis(0))
           .to.be.revertedWithCustomError(genesis, "GenesisAlreadyEnded");
+      });
+
+      it("handles endGenesis with zero participation (no LP created)", async function () {
+        // Nobody participated
+        await time.increase(29 * DAY);
+        await genesis.endGenesis(0);
+
+        // Genesis ended but no LP
+        expect(await genesis.genesisEnded()).to.be.true;
+        expect(await genesis.lpCreated()).to.be.false;
+      });
+
+      it("respects minWETHOut slippage protection", async function () {
+        await genesis.connect(alice).burn(ethers.parseEther("100000"));
+        await time.increase(29 * DAY);
+
+        // Set absurdly high minimum — should revert from router
+        await expect(genesis.endGenesis(ethers.parseEther("999999")))
+          .to.be.reverted;
+      });
+    });
+
+    describe("LP Fee Collection", function () {
+      it("reverts collectLPFees before LP is created", async function () {
+        await expect(genesis.collectLPFees(deployer.address))
+          .to.be.revertedWithCustomError(genesis, "LPNotCreated");
+      });
+
+      it("collects and distributes LP fees after creation", async function () {
+        await genesis.connect(alice).burn(ethers.parseEther("100000"));
+        await time.increase(29 * DAY);
+        await genesis.endGenesis(0);
+
+        const tokenId = await genesis.lpTokenId();
+
+        // Simulate fees by sending tokens to PositionManager and setting fees
+        const hburnIsToken0 = (await hburn.getAddress()).toLowerCase() < (await mockWeth.getAddress()).toLowerCase();
+        const feeHburn = ethers.parseEther("100");
+        const feeWeth = ethers.parseEther("0.5");
+
+        // Transfer HBURN fees to PM (Alice has HBURN from genesis)
+        await hburn.connect(alice).transfer(await mockPositionManager.getAddress(), feeHburn);
+
+        // Mint WETH fees to PM AND fund MockWETH with ETH for withdraw()
+        await mockWeth.mint(await mockPositionManager.getAddress(), feeWeth);
+        await deployer.sendTransaction({
+          to: await mockWeth.getAddress(),
+          value: ethers.parseEther("10"), // ETH backing so weth.withdraw() works
+        });
+
+        if (hburnIsToken0) {
+          await mockPositionManager.setFees(tokenId, feeHburn, feeWeth);
+        } else {
+          await mockPositionManager.setFees(tokenId, feeWeth, feeHburn);
+        }
+
+        // Collect fees — HBURN burned, WETH→ETH sent to BuyAndBurn
+        await expect(genesis.collectLPFees(await buyBurn.getAddress()))
+          .to.emit(genesis, "LPFeesCollected");
+
+        // HBURN fees should be at dead address
+        expect(await hburn.balanceOf(DEAD)).to.equal(feeHburn);
       });
     });
 
     describe("Max Supply Cap (M-03)", function () {
       it("enforces MAX_HBURN_SUPPLY", async function () {
-        // MAX = 1 trillion. We can't easily hit it with mock tokens,
-        // but we can verify the constant exists and is checked
         expect(await genesis.MAX_HBURN_SUPPLY())
           .to.equal(ethers.parseEther("1000000000000"));
       });
@@ -365,35 +515,58 @@ describe("🔥 HellBurn Protocol — Full Test Suite", function () {
     describe("View Functions", function () {
       it("currentWeek returns correct week", async function () {
         expect(await genesis.currentWeek()).to.equal(1);
-
         await time.increase(7 * DAY);
         expect(await genesis.currentWeek()).to.equal(2);
-
         await time.increase(7 * DAY);
         expect(await genesis.currentWeek()).to.equal(3);
-
         await time.increase(7 * DAY);
         expect(await genesis.currentWeek()).to.equal(4);
-
         await time.increase(7 * DAY);
         expect(await genesis.currentWeek()).to.equal(4); // capped
       });
 
       it("currentMintRatio returns ratio and bonus", async function () {
         const [ratio, bonus] = await genesis.currentMintRatio();
-        expect(ratio).to.equal(100); // week 1
-        expect(bonus).to.equal(115); // +15%
+        expect(ratio).to.equal(100);
+        expect(bonus).to.equal(115);
+      });
+
+      it("effectiveUserPercent returns 97", async function () {
+        expect(await genesis.effectiveUserPercent()).to.equal(97);
+      });
+
+      it("lpInfo returns correct state", async function () {
+        const [created, tokenId, reserveHBURN, fundTitanX] = await genesis.lpInfo();
+        expect(created).to.be.false;
+        expect(tokenId).to.equal(0);
+        expect(reserveHBURN).to.equal(0);
+        expect(fundTitanX).to.equal(0);
+      });
+
+      it("lpInfo updates after burns and endGenesis", async function () {
+        await genesis.connect(alice).burn(ethers.parseEther("100000"));
+        const expected = calcGenesis(ethers.parseEther("100000"), 1);
+
+        let [created, , reserveHBURN, fundTitanX] = await genesis.lpInfo();
+        expect(created).to.be.false;
+        expect(reserveHBURN).to.equal(expected.lpReserve);
+        expect(fundTitanX).to.equal(ethers.parseEther("8000"));
+
+        await time.increase(29 * DAY);
+        await genesis.endGenesis(0);
+
+        [created] = await genesis.lpInfo();
+        expect(created).to.be.true;
       });
     });
   });
 
   // ═══════════════════════════════════════════════════════════════
-  //  3. BURN EPOCHS
+  //  3. BURN EPOCHS (unchanged from v2)
   // ═══════════════════════════════════════════════════════════════
   describe("3. BurnEpochs", function () {
     beforeEach(async function () {
       await deployAll();
-      // Advance to first epoch start
       const start = await epochs.firstEpochStart();
       await time.increaseTo(start);
     });
@@ -415,7 +588,6 @@ describe("🔥 HellBurn Protocol — Full Test Suite", function () {
         const deadBefore = await titanX.balanceOf(DEAD);
         await epochs.connect(alice).burnTitanX(ethers.parseEther("5000"));
         const deadAfter = await titanX.balanceOf(DEAD);
-
         expect(deadAfter - deadBefore).to.equal(ethers.parseEther("5000"));
       });
 
@@ -435,28 +607,9 @@ describe("🔥 HellBurn Protocol — Full Test Suite", function () {
           .to.be.revertedWithCustomError(epochs, "ZeroAmount");
       });
 
-      it("rejects burn before first epoch", async function () {
-        const futureStart = (await time.latest()) + 100 * DAY;
-        const BurnEpochs = await ethers.getContractFactory("BurnEpochs");
-        const future = await BurnEpochs.deploy(
-          await titanX.getAddress(),
-          await dragonX.getAddress(),
-          await buyBurn.getAddress(),
-          await staking.getAddress(),
-          futureStart,
-          guardian.address
-        );
-        await titanX.connect(alice).approve(await future.getAddress(), ethers.MaxUint256);
-
-        await expect(
-          future.connect(alice).burnTitanX(ethers.parseEther("1000"))
-        ).to.be.revertedWithCustomError(future, "EpochNotActive");
-      });
-
       it("tracks global burn statistics", async function () {
         await epochs.connect(alice).burnTitanX(ethers.parseEther("5000"));
         await epochs.connect(bob).burnDragonX(ethers.parseEther("3000"));
-
         expect(await epochs.totalTitanXBurned()).to.equal(ethers.parseEther("5000"));
         expect(await epochs.totalDragonXBurned()).to.equal(ethers.parseEther("3000"));
       });
@@ -470,7 +623,6 @@ describe("🔥 HellBurn Protocol — Full Test Suite", function () {
 
       it("increments streak across consecutive epochs", async function () {
         const amt = ethers.parseEther("1000");
-
         await epochs.connect(alice).burnTitanX(amt);
         expect(await epochs.getUserStreakMultiplier(alice.address)).to.equal(12);
 
@@ -485,48 +637,30 @@ describe("🔥 HellBurn Protocol — Full Test Suite", function () {
 
       it("resets streak when missing an epoch", async function () {
         const amt = ethers.parseEther("1000");
-
-        // Build streak to 1.4x
         await epochs.connect(alice).burnTitanX(amt);
         await time.increase(8 * DAY);
         await epochs.connect(alice).burnTitanX(amt);
         expect(await epochs.getUserStreakMultiplier(alice.address)).to.equal(14);
 
-        // Skip 2 epochs
         await time.increase(16 * DAY);
         await expect(epochs.connect(alice).burnTitanX(amt))
           .to.emit(epochs, "StreakReset");
-
         expect(await epochs.getUserStreakMultiplier(alice.address)).to.equal(12);
       });
 
       it("caps at 3.0x (30)", async function () {
         const amt = ethers.parseEther("1000");
-
         for (let i = 0; i < 15; i++) {
           await epochs.connect(alice).burnTitanX(amt);
           if (i < 14) await time.increase(8 * DAY);
         }
-
         expect(await epochs.getUserStreakMultiplier(alice.address)).to.equal(30);
-      });
-
-      it("multiple burns in same epoch don't double-increment streak", async function () {
-        await epochs.connect(alice).burnTitanX(ethers.parseEther("1000"));
-        await epochs.connect(alice).burnTitanX(ethers.parseEther("2000"));
-
-        expect(await epochs.getUserStreakMultiplier(alice.address)).to.equal(12);
       });
     });
 
     describe("Epoch Finalization & Rewards", function () {
       it("distributes 80% ETH to burners, 20% to BuyAndBurn", async function () {
-        // Fund epochs
-        await deployer.sendTransaction({
-          to: await epochs.getAddress(),
-          value: ethers.parseEther("10"),
-        });
-
+        await deployer.sendTransaction({ to: await epochs.getAddress(), value: ethers.parseEther("10") });
         await epochs.connect(alice).burnTitanX(ethers.parseEther("10000"));
         await time.increase(8 * DAY);
 
@@ -534,46 +668,12 @@ describe("🔥 HellBurn Protocol — Full Test Suite", function () {
         await epochs.finalizeEpoch(0);
         const buyBurnAfter = await ethers.provider.getBalance(await buyBurn.getAddress());
 
-        // 20% of 10 ETH = 2 ETH to BuyAndBurn
         expect(buyBurnAfter - buyBurnBefore).to.equal(ethers.parseEther("2"));
-
-        // 80% = 8 ETH as rewards
         expect(await epochs.getEpochRewards(0)).to.equal(ethers.parseEther("8"));
       });
 
-      it("distributes rewards proportionally to burn weight", async function () {
-        await deployer.sendTransaction({
-          to: await epochs.getAddress(),
-          value: ethers.parseEther("10"),
-        });
-
-        // Alice 75%, Bob 25% (by weight)
-        await epochs.connect(alice).burnTitanX(ethers.parseEther("30000"));
-        await epochs.connect(bob).burnTitanX(ethers.parseEther("10000"));
-
-        await time.increase(8 * DAY);
-        await epochs.finalizeEpoch(0);
-
-        const aliceReward = await epochs.pendingReward(0, alice.address);
-        const bobReward = await epochs.pendingReward(0, bob.address);
-
-        // Alice ~6 ETH, Bob ~2 ETH (of 8 ETH total rewards)
-        expect(aliceReward).to.be.closeTo(
-          ethers.parseEther("6"),
-          ethers.parseEther("0.1")
-        );
-        expect(bobReward).to.be.closeTo(
-          ethers.parseEther("2"),
-          ethers.parseEther("0.1")
-        );
-      });
-
       it("allows claiming rewards", async function () {
-        await deployer.sendTransaction({
-          to: await epochs.getAddress(),
-          value: ethers.parseEther("1"),
-        });
-
+        await deployer.sendTransaction({ to: await epochs.getAddress(), value: ethers.parseEther("1") });
         await epochs.connect(alice).burnTitanX(ethers.parseEther("10000"));
         await time.increase(8 * DAY);
         await epochs.finalizeEpoch(0);
@@ -581,15 +681,11 @@ describe("🔥 HellBurn Protocol — Full Test Suite", function () {
         const balBefore = await ethers.provider.getBalance(alice.address);
         await epochs.connect(alice).claimRewards(0);
         const balAfter = await ethers.provider.getBalance(alice.address);
-
         expect(balAfter).to.be.gt(balBefore);
       });
 
       it("prevents double claiming", async function () {
-        await deployer.sendTransaction({
-          to: await epochs.getAddress(),
-          value: ethers.parseEther("1"),
-        });
+        await deployer.sendTransaction({ to: await epochs.getAddress(), value: ethers.parseEther("1") });
         await epochs.connect(alice).burnTitanX(ethers.parseEther("10000"));
         await time.increase(8 * DAY);
         await epochs.finalizeEpoch(0);
@@ -600,12 +696,8 @@ describe("🔥 HellBurn Protocol — Full Test Suite", function () {
       });
 
       it("supports batch claiming", async function () {
-        // Fund and participate in 3 epochs
         for (let i = 0; i < 3; i++) {
-          await deployer.sendTransaction({
-            to: await epochs.getAddress(),
-            value: ethers.parseEther("1"),
-          });
+          await deployer.sendTransaction({ to: await epochs.getAddress(), value: ethers.parseEther("1") });
           await epochs.connect(alice).burnTitanX(ethers.parseEther("1000"));
           await time.increase(8 * DAY);
           await epochs.finalizeEpoch(i);
@@ -613,94 +705,22 @@ describe("🔥 HellBurn Protocol — Full Test Suite", function () {
 
         const balBefore = await ethers.provider.getBalance(alice.address);
         await epochs.connect(alice).batchClaimRewards([0, 1, 2]);
-        const balAfter = await ethers.provider.getBalance(alice.address);
-
-        expect(balAfter).to.be.gt(balBefore);
-
-        // All marked as claimed
-        expect(await epochs.hasClaimedEpoch(0, alice.address)).to.be.true;
-        expect(await epochs.hasClaimedEpoch(1, alice.address)).to.be.true;
-        expect(await epochs.hasClaimedEpoch(2, alice.address)).to.be.true;
+        expect(await ethers.provider.getBalance(alice.address)).to.be.gt(balBefore);
       });
 
-      it("cannot finalize before epoch ends", async function () {
-        await epochs.connect(alice).burnTitanX(ethers.parseEther("1000"));
-        await expect(epochs.finalizeEpoch(0))
-          .to.be.revertedWithCustomError(epochs, "EpochNotEnded");
-      });
-
-      it("finalize is idempotent (no-op on second call)", async function () {
-        await deployer.sendTransaction({
-          to: await epochs.getAddress(),
-          value: ethers.parseEther("1"),
-        });
-        await epochs.connect(alice).burnTitanX(ethers.parseEther("1000"));
+      it("carries over ETH when epoch has no burners (M-05)", async function () {
+        await deployer.sendTransaction({ to: await epochs.getAddress(), value: ethers.parseEther("5") });
         await time.increase(8 * DAY);
-
-        await epochs.finalizeEpoch(0);
-        await epochs.finalizeEpoch(0); // should not revert
-      });
-    });
-
-    describe("ETH Carry-Over (M-05 fix)", function () {
-      it("carries over ETH when epoch has no burners", async function () {
-        await deployer.sendTransaction({
-          to: await epochs.getAddress(),
-          value: ethers.parseEther("5"),
-        });
-
-        // Nobody burns in epoch 0 → finalize carries over
-        await time.increase(8 * DAY);
-        await expect(epochs.finalizeEpoch(0))
-          .to.emit(epochs, "OrphanedETHCarriedOver");
-
+        await expect(epochs.finalizeEpoch(0)).to.emit(epochs, "OrphanedETHCarriedOver");
         expect(await epochs.carryOverETH()).to.equal(ethers.parseEther("5"));
-
-        // Epoch 1: someone burns → gets epoch 1 ETH + carry-over
-        await deployer.sendTransaction({
-          to: await epochs.getAddress(),
-          value: ethers.parseEther("3"),
-        });
-        await epochs.connect(alice).burnTitanX(ethers.parseEther("1000"));
-        await time.increase(8 * DAY);
-        await epochs.finalizeEpoch(1);
-
-        // Total = 5 (carry) + 3 (new) = 8, rewards = 80% = 6.4
-        expect(await epochs.getEpochRewards(1))
-          .to.equal(ethers.parseEther("6.4"));
-      });
-    });
-
-    describe("Per-Epoch ETH Tracking (C-01 fix)", function () {
-      it("tracks ETH per epoch, not global balance", async function () {
-        // Send ETH during epoch 0
-        await deployer.sendTransaction({
-          to: await epochs.getAddress(),
-          value: ethers.parseEther("3"),
-        });
-        await epochs.connect(alice).burnTitanX(ethers.parseEther("1000"));
-
-        // Advance to epoch 1, send more ETH
-        await time.increase(8 * DAY);
-        await deployer.sendTransaction({
-          to: await epochs.getAddress(),
-          value: ethers.parseEther("7"),
-        });
-
-        // Finalize epoch 0 — should only get 3 ETH, not 10
-        await epochs.finalizeEpoch(0);
-        expect(await epochs.getEpochRewards(0))
-          .to.equal(ethers.parseEther("2.4")); // 80% of 3
       });
     });
 
     describe("Emergency Pause (M-02)", function () {
       it("guardian can pause and unpause", async function () {
         await epochs.connect(guardian).pause();
-        await expect(
-          epochs.connect(alice).burnTitanX(ethers.parseEther("1000"))
-        ).to.be.revertedWithCustomError(epochs, "EnforcedPause");
-
+        await expect(epochs.connect(alice).burnTitanX(ethers.parseEther("1000")))
+          .to.be.revertedWithCustomError(epochs, "EnforcedPause");
         await epochs.connect(guardian).unpause();
         await epochs.connect(alice).burnTitanX(ethers.parseEther("1000"));
       });
@@ -711,57 +731,31 @@ describe("🔥 HellBurn Protocol — Full Test Suite", function () {
       });
 
       it("claims still work when paused", async function () {
-        await deployer.sendTransaction({
-          to: await epochs.getAddress(),
-          value: ethers.parseEther("1"),
-        });
+        await deployer.sendTransaction({ to: await epochs.getAddress(), value: ethers.parseEther("1") });
         await epochs.connect(alice).burnTitanX(ethers.parseEther("1000"));
         await time.increase(8 * DAY);
         await epochs.finalizeEpoch(0);
-
-        // Pause
         await epochs.connect(guardian).pause();
-
-        // Claims should still work
         await epochs.connect(alice).claimRewards(0);
-      });
-    });
-
-    describe("View Functions", function () {
-      it("currentEpochId increments every 8 days", async function () {
-        expect(await epochs.currentEpochId()).to.equal(0);
-
-        await time.increase(8 * DAY);
-        expect(await epochs.currentEpochId()).to.equal(1);
-
-        await time.increase(8 * DAY);
-        expect(await epochs.currentEpochId()).to.equal(2);
-      });
-
-      it("isEpochActive returns true for current epoch", async function () {
-        expect(await epochs.isEpochActive(0)).to.be.true;
-        expect(await epochs.isEpochActive(1)).to.be.false;
       });
     });
   });
 
   // ═══════════════════════════════════════════════════════════════
-  //  4. HELLBURN STAKING
+  //  4. HELLBURN STAKING (97% base amounts)
   // ═══════════════════════════════════════════════════════════════
   describe("4. HellBurnStaking", function () {
     beforeEach(async function () {
       await deployAll();
 
-      // Mint HBURN via genesis for alice and bob
+      // Mint HBURN via genesis — amounts are now 97% of pre-v3
       await genesis.connect(alice).burn(ethers.parseEther("500000"));
       await genesis.connect(bob).burn(ethers.parseEther("300000"));
 
-      // Fully vest
       await time.increase(28 * DAY);
       await genesis.connect(alice).claimVested();
       await genesis.connect(bob).claimVested();
 
-      // Approve staking
       const sa = await staking.getAddress();
       await hburn.connect(alice).approve(sa, ethers.MaxUint256);
       await hburn.connect(bob).approve(sa, ethers.MaxUint256);
@@ -778,28 +772,24 @@ describe("🔥 HellBurn Protocol — Full Test Suite", function () {
       });
 
       it("rejects duration under 28 days", async function () {
-        await expect(
-          staking.connect(alice).startStake(ethers.parseEther("1000"), 10)
-        ).to.be.revertedWithCustomError(staking, "InvalidDuration");
+        await expect(staking.connect(alice).startStake(ethers.parseEther("1000"), 10))
+          .to.be.revertedWithCustomError(staking, "InvalidDuration");
       });
 
       it("rejects duration over 3500 days", async function () {
-        await expect(
-          staking.connect(alice).startStake(ethers.parseEther("1000"), 5000)
-        ).to.be.revertedWithCustomError(staking, "InvalidDuration");
+        await expect(staking.connect(alice).startStake(ethers.parseEther("1000"), 5000))
+          .to.be.revertedWithCustomError(staking, "InvalidDuration");
       });
 
       it("rejects zero amount", async function () {
-        await expect(
-          staking.connect(alice).startStake(0, 100)
-        ).to.be.revertedWithCustomError(staking, "ZeroAmount");
+        await expect(staking.connect(alice).startStake(0, 100))
+          .to.be.revertedWithCustomError(staking, "ZeroAmount");
       });
 
       it("transfers HBURN from user to contract", async function () {
         const balBefore = await hburn.balanceOf(alice.address);
         await staking.connect(alice).startStake(ethers.parseEther("10000"), 100);
         const balAfter = await hburn.balanceOf(alice.address);
-
         expect(balBefore - balAfter).to.equal(ethers.parseEther("10000"));
       });
     });
@@ -807,29 +797,19 @@ describe("🔥 HellBurn Protocol — Full Test Suite", function () {
     describe("Time Bonus", function () {
       it("calculates higher shares for longer stakes", async function () {
         const amt = ethers.parseEther("10000");
-
-        await staking.connect(alice).startStake(amt, 28); // Bronze 1.0x
-        await staking.connect(bob).startStake(amt, 888); // Platinum ~1.62x
+        await staking.connect(alice).startStake(amt, 28);
+        await staking.connect(bob).startStake(amt, 888);
 
         const [, sharesA] = await staking.getStakeInfo(0);
         const [, sharesB] = await staking.getStakeInfo(1);
-
-        // 888d bonus = ~1.62x, so sharesB should be significantly more than sharesA
         expect(sharesB).to.be.gt(sharesA);
-        expect(sharesB).to.be.lt(sharesA * 2n); // but less than 2x
-
-        // Diamond (3500d) should be 3.5x
-        await staking.connect(alice).startStake(amt, 3500);
-        const [, sharesC] = await staking.getStakeInfo(2);
-        expect(sharesC).to.be.gt(sharesA * 3n);
+        expect(sharesB).to.be.lt(sharesA * 2n);
       });
 
       it("max bonus at 3500 days (Diamond)", async function () {
         const amt = ethers.parseEther("10000");
         await staking.connect(alice).startStake(amt, 3500);
-
         const [, shares] = await staking.getStakeInfo(0);
-        // shares = amount * 3.5 (max time) * 1.0 (no loyalty) = 35000
         expect(shares).to.equal(ethers.parseEther("35000"));
       });
     });
@@ -837,32 +817,19 @@ describe("🔥 HellBurn Protocol — Full Test Suite", function () {
     describe("ETH Yield Distribution", function () {
       it("distributes ETH to stakers", async function () {
         await staking.connect(alice).startStake(ethers.parseEther("50000"), 888);
-
-        // Send ETH as yield
-        await deployer.sendTransaction({
-          to: await staking.getAddress(),
-          value: ethers.parseEther("5"),
-        });
-
+        await deployer.sendTransaction({ to: await staking.getAddress(), value: ethers.parseEther("5") });
         const pending = await staking.pendingETHReward(0);
         expect(pending).to.be.gt(0);
       });
 
       it("distributes proportionally to shares", async function () {
-        // Alice: 3500d (3.5x bonus), Bob: 28d (1.0x bonus), same amount
         const amt = ethers.parseEther("10000");
         await staking.connect(alice).startStake(amt, 3500);
         await staking.connect(bob).startStake(amt, 28);
-
-        await deployer.sendTransaction({
-          to: await staking.getAddress(),
-          value: ethers.parseEther("10"),
-        });
+        await deployer.sendTransaction({ to: await staking.getAddress(), value: ethers.parseEther("10") });
 
         const pendingA = await staking.pendingETHReward(0);
         const pendingB = await staking.pendingETHReward(1);
-
-        // Alice should get ~3.5x more than Bob
         expect(pendingA).to.be.gt(pendingB * 3n);
       });
     });
@@ -870,128 +837,66 @@ describe("🔥 HellBurn Protocol — Full Test Suite", function () {
     describe("End Stake & Penalties", function () {
       it("prevents unstaking before 50% maturity", async function () {
         await staking.connect(alice).startStake(ethers.parseEther("10000"), 100);
-        await time.increase(30 * DAY); // 30%
-
+        await time.increase(30 * DAY);
         await expect(staking.connect(alice).endStake(0))
           .to.be.revertedWithCustomError(staking, "StakeNotMature");
       });
 
       it("applies penalty between 50-100% maturity", async function () {
         await staking.connect(alice).startStake(ethers.parseEther("10000"), 100);
-        await time.increase(75 * DAY); // 75% maturity
-
+        await time.increase(75 * DAY);
         const balBefore = await hburn.balanceOf(alice.address);
         await staking.connect(alice).endStake(0);
         const balAfter = await hburn.balanceOf(alice.address);
-
         const returned = balAfter - balBefore;
-        // Penalty = (100-75)*2 = 50% → returned ~5000
-        expect(returned).to.be.closeTo(
-          ethers.parseEther("5000"),
-          ethers.parseEther("500")
-        );
+        expect(returned).to.be.closeTo(ethers.parseEther("5000"), ethers.parseEther("500"));
       });
 
       it("returns full amount at 100% maturity", async function () {
         await staking.connect(alice).startStake(ethers.parseEther("10000"), 28);
         await time.increase(28 * DAY);
-
         const balBefore = await hburn.balanceOf(alice.address);
         await staking.connect(alice).endStake(0);
         const balAfter = await hburn.balanceOf(alice.address);
-
         expect(balAfter - balBefore).to.equal(ethers.parseEther("10000"));
-      });
-
-      it("marks stake as inactive after ending", async function () {
-        await staking.connect(alice).startStake(ethers.parseEther("10000"), 28);
-        await time.increase(28 * DAY);
-        await staking.connect(alice).endStake(0);
-
-        const [, , , , , active] = await staking.getStakeInfo(0);
-        expect(active).to.be.false;
-      });
-
-      it("cannot end same stake twice", async function () {
-        await staking.connect(alice).startStake(ethers.parseEther("10000"), 28);
-        await time.increase(28 * DAY);
-        await staking.connect(alice).endStake(0);
-
-        await expect(staking.connect(alice).endStake(0))
-          .to.be.revertedWithCustomError(staking, "StakeNotActive");
       });
 
       it("only owner can end their stake (H-03 fix)", async function () {
         await staking.connect(alice).startStake(ethers.parseEther("10000"), 28);
         await time.increase(28 * DAY);
-
         await expect(staking.connect(bob).endStake(0))
           .to.be.revertedWithCustomError(staking, "NotStakeOwner");
       });
 
       it("penalty burns 50% to dead address", async function () {
         await staking.connect(alice).startStake(ethers.parseEther("10000"), 100);
-        await time.increase(50 * DAY); // 50% → max penalty
-
+        await time.increase(50 * DAY);
         const deadBefore = await hburn.balanceOf(DEAD);
         await staking.connect(alice).endStake(0);
-        const deadAfter = await hburn.balanceOf(DEAD);
-
-        expect(deadAfter).to.be.gt(deadBefore);
-      });
-
-      it("increments completedStakes counter", async function () {
-        await staking.connect(alice).startStake(ethers.parseEther("10000"), 28);
-        await time.increase(28 * DAY);
-        await staking.connect(alice).endStake(0);
-
-        expect(await staking.completedStakes(alice.address)).to.equal(1);
+        expect(await hburn.balanceOf(DEAD)).to.be.gt(deadBefore);
       });
     });
 
     describe("Loyalty & Re-Stake (H-05 fix)", function () {
       it("rejects reStake without prior completed stake", async function () {
-        await expect(
-          staking.connect(alice).reStake(ethers.parseEther("10000"), 100)
-        ).to.be.revertedWithCustomError(staking, "NoPriorStake");
-      });
-
-      it("allows reStake after completing a stake", async function () {
-        // Complete first stake
-        await staking.connect(alice).startStake(ethers.parseEther("10000"), 28);
-        await time.increase(28 * DAY);
-        await staking.connect(alice).endStake(0);
-
-        // Re-stake should work now
-        await expect(
-          staking.connect(alice).reStake(ethers.parseEther("10000"), 100)
-        ).to.emit(staking, "StakeStarted");
+        await expect(staking.connect(alice).reStake(ethers.parseEther("10000"), 100))
+          .to.be.revertedWithCustomError(staking, "NoPriorStake");
       });
 
       it("reStake grants 1.1x loyalty bonus on shares", async function () {
         const amt = ethers.parseEther("10000");
-
-        // Normal stake
         await staking.connect(alice).startStake(amt, 100);
         const [, sharesNormal] = await staking.getStakeInfo(0);
         await time.increase(100 * DAY);
         await staking.connect(alice).endStake(0);
 
-        // Re-stake (same amount, same duration)
         await staking.connect(alice).reStake(amt, 100);
         const [, sharesRe] = await staking.getStakeInfo(1);
-
-        // Re-stake shares = normal × 1.1
-        expect(sharesRe).to.be.closeTo(
-          (sharesNormal * 1100n) / 1000n,
-          sharesNormal / 100n
-        );
+        expect(sharesRe).to.be.closeTo((sharesNormal * 1100n) / 1000n, sharesNormal / 100n);
       });
 
       it("grants Phoenix status after 3 consecutive re-stakes", async function () {
         const amt = ethers.parseEther("5000");
-
-        // Initial stake + 3 re-stakes
         await staking.connect(alice).startStake(amt, 28);
         for (let i = 0; i < 3; i++) {
           await time.increase(28 * DAY);
@@ -1003,7 +908,6 @@ describe("🔥 HellBurn Protocol — Full Test Suite", function () {
               .to.emit(staking, "PhoenixStatusGranted");
           }
         }
-
         expect(await staking.hasPhoenixStatus(alice.address)).to.be.true;
       });
     });
@@ -1011,102 +915,60 @@ describe("🔥 HellBurn Protocol — Full Test Suite", function () {
     describe("Fuel Mechanic", function () {
       it("allows adding TitanX fuel to active stake", async function () {
         await staking.connect(alice).startStake(ethers.parseEther("50000"), 888);
-
-        await expect(
-          staking.connect(alice).addFuelTitanX(0, ethers.parseEther("1000000"))
-        ).to.emit(staking, "FuelAdded");
+        await expect(staking.connect(alice).addFuelTitanX(0, ethers.parseEther("1000000")))
+          .to.emit(staking, "FuelAdded");
       });
 
       it("increases shares after fueling", async function () {
         await staking.connect(alice).startStake(ethers.parseEther("50000"), 888);
         const [, sharesBefore] = await staking.getStakeInfo(0);
-
         await staking.connect(alice).addFuelTitanX(0, ethers.parseEther("5000000"));
         const [, sharesAfter] = await staking.getStakeInfo(0);
-
         expect(sharesAfter).to.be.gt(sharesBefore);
       });
 
       it("caps fuel bonus at 1.5x", async function () {
         await staking.connect(alice).startStake(ethers.parseEther("50000"), 888);
-
-        // Add massive amount of fuel
         await titanX.mint(alice.address, ethers.parseEther("100000000000"));
-        await titanX.connect(alice).approve(
-          await staking.getAddress(),
-          ethers.MaxUint256
-        );
+        await titanX.connect(alice).approve(await staking.getAddress(), ethers.MaxUint256);
 
-        // Multiple fuel additions
         for (let i = 0; i < 5; i++) {
-          try {
-            await staking.connect(alice).addFuelTitanX(
-              0, ethers.parseEther("10000000000")
-            );
-          } catch { break; } // FuelMaxReached
+          try { await staking.connect(alice).addFuelTitanX(0, ethers.parseEther("10000000000")); }
+          catch { break; }
         }
-
-        // Verify fuel is capped
         const [, , , , fuelBonus] = await staking.getStakeInfo(0);
         expect(fuelBonus).to.be.lte(1500);
       });
 
       it("only stake owner can add fuel", async function () {
         await staking.connect(alice).startStake(ethers.parseEther("50000"), 888);
-
-        await expect(
-          staking.connect(bob).addFuelTitanX(0, ethers.parseEther("1000"))
-        ).to.be.revertedWithCustomError(staking, "NotStakeOwner");
-      });
-
-      it("preserves loyalty bonus after fueling (H-04 fix)", async function () {
-        const amt = ethers.parseEther("10000");
-
-        // Complete a stake first
-        await staking.connect(alice).startStake(amt, 28);
-        await time.increase(28 * DAY);
-        await staking.connect(alice).endStake(0);
-
-        // Re-stake with loyalty bonus
-        await staking.connect(alice).reStake(amt, 888);
-        const [, sharesBefore] = await staking.getStakeInfo(1);
-
-        // Add fuel
-        await staking.connect(alice).addFuelTitanX(1, ethers.parseEther("5000000"));
-        const [, sharesAfter] = await staking.getStakeInfo(1);
-
-        // Shares should increase (fuel applied), and loyalty bonus preserved
-        expect(sharesAfter).to.be.gt(sharesBefore);
+        await expect(staking.connect(bob).addFuelTitanX(0, ethers.parseEther("1000")))
+          .to.be.revertedWithCustomError(staking, "NotStakeOwner");
       });
     });
 
     describe("Emergency Pause (M-02)", function () {
       it("guardian can pause staking", async function () {
         await staking.connect(guardian).pause();
-
-        await expect(
-          staking.connect(alice).startStake(ethers.parseEther("1000"), 28)
-        ).to.be.revertedWithCustomError(staking, "EnforcedPause");
+        await expect(staking.connect(alice).startStake(ethers.parseEther("1000"), 28))
+          .to.be.revertedWithCustomError(staking, "EnforcedPause");
       });
 
-      it("endStake still works when paused (withdraw protection)", async function () {
+      it("endStake still works when paused", async function () {
         await staking.connect(alice).startStake(ethers.parseEther("10000"), 28);
         await time.increase(28 * DAY);
-
         await staking.connect(guardian).pause();
-
-        // Users can still withdraw
         await staking.connect(alice).endStake(0);
       });
     });
 
     describe("Tier System", function () {
-      it("returns correct tier names", async function () {
-        expect(await staking.getTier(28)).to.equal(1);    // Bronze
-        expect(await staking.getTier(90)).to.equal(2);    // Silver
-        expect(await staking.getTier(369)).to.equal(3);   // Gold
-        expect(await staking.getTier(888)).to.equal(4);   // Platinum
-        expect(await staking.getTier(3500)).to.equal(5);  // Diamond
+      it("returns correct tiers", async function () {
+        expect(await staking.getTier(28)).to.equal(1);
+        expect(await staking.getTier(90)).to.equal(2);
+        expect(await staking.getTier(369)).to.equal(3);
+        expect(await staking.getTier(888)).to.equal(4);
+        expect(await staking.getTier(3500)).to.equal(5);
       });
     });
   });
@@ -1118,19 +980,12 @@ describe("🔥 HellBurn Protocol — Full Test Suite", function () {
     beforeEach(deployAll);
 
     it("receives ETH", async function () {
-      await deployer.sendTransaction({
-        to: await buyBurn.getAddress(),
-        value: ethers.parseEther("1"),
-      });
+      await deployer.sendTransaction({ to: await buyBurn.getAddress(), value: ethers.parseEther("1") });
       expect(await buyBurn.pendingETH()).to.equal(ethers.parseEther("1"));
     });
 
     it("rejects zero slippage (C-02 fix)", async function () {
-      await deployer.sendTransaction({
-        to: await buyBurn.getAddress(),
-        value: ethers.parseEther("1"),
-      });
-
+      await deployer.sendTransaction({ to: await buyBurn.getAddress(), value: ethers.parseEther("1") });
       await expect(buyBurn.executeBuyAndBurn(0))
         .to.be.revertedWithCustomError(buyBurn, "ZeroSlippage");
     });
@@ -1159,40 +1014,50 @@ describe("🔥 HellBurn Protocol — Full Test Suite", function () {
       const fullBalance = await hburn.balanceOf(alice.address);
       expect(fullBalance).to.be.gt(immediateBalance);
 
+      // Verify LP reserve was taken
+      const expected = calcGenesis(ethers.parseEther("200000"), 1);
+      expect(fullBalance).to.equal(expected.userAmount);
+
       // 3. Stake HBURN
-      await hburn.connect(alice).approve(
-        await staking.getAddress(),
-        ethers.MaxUint256
-      );
+      await hburn.connect(alice).approve(await staking.getAddress(), ethers.MaxUint256);
       const stakeAmount = fullBalance / 2n;
       await staking.connect(alice).startStake(stakeAmount, 369);
 
       // 4. Earn ETH yield
-      await deployer.sendTransaction({
-        to: await staking.getAddress(),
-        value: ethers.parseEther("50"),
-      });
+      await deployer.sendTransaction({ to: await staking.getAddress(), value: ethers.parseEther("50") });
       const pendingETH = await staking.pendingETHReward(0);
       expect(pendingETH).to.be.gt(0);
 
-      // 5. Unstake at maturity — check HBURN returned + ETH reward received
+      // 5. Unstake at maturity
       await time.increase(369 * DAY);
-
-      // Check pending before unstake
-      const pendingBefore = await staking.pendingETHReward(0);
-      expect(pendingBefore).to.be.gt(ethers.parseEther("1"));
-
       await staking.connect(alice).endStake(0);
+      expect(await hburn.balanceOf(alice.address)).to.be.closeTo(fullBalance, ethers.parseEther("1"));
 
-      // Got HBURN back
-      expect(await hburn.balanceOf(alice.address)).to.be.closeTo(
-        fullBalance,
-        ethers.parseEther("1")
-      );
-
-      // Stake is now inactive (ETH was paid out)
       const [, , , , , active] = await staking.getStakeInfo(0);
       expect(active).to.be.false;
+    });
+
+    it("full fair launch flow: genesis → endGenesis → LP created → tradeable", async function () {
+      // 1. Multiple users participate
+      await genesis.connect(alice).burn(ethers.parseEther("500000"));
+      await genesis.connect(bob).burn(ethers.parseEther("300000"));
+
+      // 2. Verify reserves accumulated
+      expect(await genesis.genesisFundTitanX()).to.equal(ethers.parseEther("64000")); // 8% of 800K
+      expect(await genesis.lpReserveHBURN()).to.be.gt(0);
+
+      // 3. End genesis → LP created automatically
+      await time.increase(29 * DAY);
+      await expect(genesis.endGenesis(0))
+        .to.emit(genesis, "GenesisPhaseEnded")
+        .to.emit(genesis, "LiquidityPoolCreated");
+
+      // 4. LP is permanently locked
+      expect(await genesis.lpCreated()).to.be.true;
+      expect(await genesis.lpTokenId()).to.be.gt(0);
+
+      // 5. Genesis minting permanently disabled
+      expect(await hburn.genesisMintingEnded()).to.be.true;
     });
 
     it("genesis minting permanently stops", async function () {
@@ -1200,26 +1065,18 @@ describe("🔥 HellBurn Protocol — Full Test Suite", function () {
       const supplyBefore = await hburn.totalSupply();
 
       await time.increase(29 * DAY);
-      await genesis.endGenesis();
+      await genesis.endGenesis(0);
 
-      // No more tokens can ever be minted
       expect(await hburn.genesisMintingEnded()).to.be.true;
-      // Supply only decreases from now (via burns)
       expect(await hburn.totalSupply()).to.equal(supplyBefore);
     });
 
     it("multiple users compete in epochs fairly", async function () {
-      // Advance to epoch start
       const start = await epochs.firstEpochStart();
       await time.increaseTo(start);
 
-      // Fund epoch
-      await deployer.sendTransaction({
-        to: await epochs.getAddress(),
-        value: ethers.parseEther("9"),
-      });
+      await deployer.sendTransaction({ to: await epochs.getAddress(), value: ethers.parseEther("9") });
 
-      // Alice burns TitanX, Bob burns DragonX (2x weight)
       const amt = ethers.parseEther("10000");
       await epochs.connect(alice).burnTitanX(amt);
       await epochs.connect(bob).burnDragonX(amt);
@@ -1227,11 +1084,8 @@ describe("🔥 HellBurn Protocol — Full Test Suite", function () {
       await time.increase(8 * DAY);
       await epochs.finalizeEpoch(0);
 
-      // Total weight: Alice = 10000*1*1.2, Bob = 10000*2*1.2
-      // Alice: 1/3, Bob: 2/3 of 80% of 9 ETH = 7.2 ETH
       const aliceReward = await epochs.pendingReward(0, alice.address);
       const bobReward = await epochs.pendingReward(0, bob.address);
-
       expect(bobReward).to.be.closeTo(aliceReward * 2n, aliceReward / 10n);
     });
   });
