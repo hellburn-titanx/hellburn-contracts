@@ -3,6 +3,8 @@ const { ethers } = require("hardhat");
 const { time } = require("@nomicfoundation/hardhat-toolbox/network-helpers");
 
 const DAY = 86400;
+// [M-02] Deadline constant for tests
+const FAR_FUTURE = 9999999999;
 const DEAD = "0x000000000000000000000000000000000000dEaD";
 const INITIAL_BALANCE = ethers.parseEther("10000000"); // 10M
 const LP_RESERVE_PCT = 3n;
@@ -143,14 +145,14 @@ describe("🔥 HellBurn Protocol — Full Test Suite (Trustless v4.0)", function
 
     it("permanently disables minting after genesis ends", async function () {
       await time.increase(29 * DAY);
-      await genesis.endGenesis(0);
+      await genesis.endGenesis(1, FAR_FUTURE);
       expect(await hburn.genesisMintingEnded()).to.be.true;
     });
 
     it("emits event on minting end", async function () {
       await genesis.connect(alice).burn(ethers.parseEther("1000"));
       await time.increase(29 * DAY);
-      await expect(genesis.endGenesis(0))
+      await expect(genesis.endGenesis(1, FAR_FUTURE))
         .to.emit(hburn, "GenesisMintingPermanentlyEnded");
     });
 
@@ -217,7 +219,7 @@ describe("🔥 HellBurn Protocol — Full Test Suite (Trustless v4.0)", function
 
       it("rejects burn after genesis ends", async function () {
         await time.increase(29 * DAY);
-        await genesis.endGenesis(0);
+        await genesis.endGenesis(1, FAR_FUTURE);
         await expect(genesis.connect(alice).burn(ethers.parseEther("1000")))
           .to.be.revertedWithCustomError(genesis, "GenesisAlreadyEnded");
       });
@@ -281,7 +283,7 @@ describe("🔥 HellBurn Protocol — Full Test Suite (Trustless v4.0)", function
       it("stakeTreasury stakes ALL treasury TitanX for 3500 days", async function () {
         await genesis.connect(alice).burn(ethers.parseEther("100000"));
         await time.increase(29 * DAY);
-        await genesis.endGenesis(0);
+        await genesis.endGenesis(1, FAR_FUTURE);
 
         await expect(genesis.stakeTreasury())
           .to.emit(genesis, "TreasuryStaked")
@@ -299,7 +301,7 @@ describe("🔥 HellBurn Protocol — Full Test Suite (Trustless v4.0)", function
       it("stakeTreasury reverts if already staked", async function () {
         await genesis.connect(alice).burn(ethers.parseEther("100000"));
         await time.increase(29 * DAY);
-        await genesis.endGenesis(0);
+        await genesis.endGenesis(1, FAR_FUTURE);
         await genesis.stakeTreasury();
 
         await expect(genesis.stakeTreasury())
@@ -309,7 +311,7 @@ describe("🔥 HellBurn Protocol — Full Test Suite (Trustless v4.0)", function
       it("stakeTreasury callable by anyone (permissionless)", async function () {
         await genesis.connect(alice).burn(ethers.parseEther("100000"));
         await time.increase(29 * DAY);
-        await genesis.endGenesis(0);
+        await genesis.endGenesis(1, FAR_FUTURE);
 
         // Charlie (random person) can stake the treasury
         await expect(genesis.connect(charlie).stakeTreasury())
@@ -319,7 +321,7 @@ describe("🔥 HellBurn Protocol — Full Test Suite (Trustless v4.0)", function
       it("claimTreasuryYield forwards ETH to BuyAndBurn", async function () {
         await genesis.connect(alice).burn(ethers.parseEther("100000"));
         await time.increase(29 * DAY);
-        await genesis.endGenesis(0);
+        await genesis.endGenesis(1, FAR_FUTURE);
         await genesis.stakeTreasury();
 
         // Simulate TitanX ETH yield by funding the mock
@@ -337,7 +339,7 @@ describe("🔥 HellBurn Protocol — Full Test Suite (Trustless v4.0)", function
       it("claimTreasuryYield callable by anyone", async function () {
         await genesis.connect(alice).burn(ethers.parseEther("100000"));
         await time.increase(29 * DAY);
-        await genesis.endGenesis(0);
+        await genesis.endGenesis(1, FAR_FUTURE);
         await genesis.stakeTreasury();
 
         await titanX.fundETHPayout({ value: ethers.parseEther("1") });
@@ -352,7 +354,7 @@ describe("🔥 HellBurn Protocol — Full Test Suite (Trustless v4.0)", function
         expect(staked).to.be.false;
 
         await time.increase(29 * DAY);
-        await genesis.endGenesis(0);
+        await genesis.endGenesis(1, FAR_FUTURE);
         await genesis.stakeTreasury();
 
         [amount, staked] = await genesis.treasuryInfo();
@@ -398,34 +400,34 @@ describe("🔥 HellBurn Protocol — Full Test Suite (Trustless v4.0)", function
       it("anyone can call endGenesis after 28 days", async function () {
         await genesis.connect(alice).burn(ethers.parseEther("100000"));
         await time.increase(29 * DAY);
-        await expect(genesis.connect(charlie).endGenesis(0))
+        await expect(genesis.connect(charlie).endGenesis(1, FAR_FUTURE))
           .to.emit(genesis, "GenesisPhaseEnded");
       });
 
       it("creates LP via PositionManager", async function () {
         await genesis.connect(alice).burn(ethers.parseEther("100000"));
         await time.increase(29 * DAY);
-        await expect(genesis.connect(charlie).endGenesis(0))
+        await expect(genesis.connect(charlie).endGenesis(1, FAR_FUTURE))
           .to.emit(genesis, "LiquidityPoolCreated");
         expect(await genesis.lpCreated()).to.be.true;
       });
 
       it("cannot end genesis early", async function () {
-        await expect(genesis.endGenesis(0))
+        await expect(genesis.endGenesis(1, FAR_FUTURE))
           .to.be.revertedWithCustomError(genesis, "GenesisNotYetEnded");
       });
 
       it("cannot end genesis twice", async function () {
         await genesis.connect(alice).burn(ethers.parseEther("100000"));
         await time.increase(29 * DAY);
-        await genesis.endGenesis(0);
-        await expect(genesis.endGenesis(0))
+        await genesis.endGenesis(1, FAR_FUTURE);
+        await expect(genesis.endGenesis(1, FAR_FUTURE))
           .to.be.revertedWithCustomError(genesis, "GenesisAlreadyEnded");
       });
 
       it("handles zero participation (no LP)", async function () {
         await time.increase(29 * DAY);
-        await genesis.endGenesis(0);
+        await genesis.endGenesis(1, FAR_FUTURE);
         expect(await genesis.genesisEnded()).to.be.true;
         expect(await genesis.lpCreated()).to.be.false;
       });
@@ -440,7 +442,7 @@ describe("🔥 HellBurn Protocol — Full Test Suite (Trustless v4.0)", function
       it("collects and distributes fees", async function () {
         await genesis.connect(alice).burn(ethers.parseEther("100000"));
         await time.increase(29 * DAY);
-        await genesis.endGenesis(0);
+        await genesis.endGenesis(1, FAR_FUTURE);
 
         const tokenId = await genesis.lpTokenId();
         const hburnIsToken0 = (await hburn.getAddress()).toLowerCase() < (await mockWeth.getAddress()).toLowerCase();
@@ -457,9 +459,12 @@ describe("🔥 HellBurn Protocol — Full Test Suite (Trustless v4.0)", function
           await mockPositionManager.setFees(tokenId, feeWeth, feeHburn);
         }
 
+        const supplyBefore = await hburn.totalSupply();
         await expect(genesis.collectLPFees())
           .to.emit(genesis, "LPFeesCollected");
-        expect(await hburn.balanceOf(DEAD)).to.equal(feeHburn);
+        // [M-05] burn() destroys tokens — totalSupply decreases, dead-address stays empty
+        const supplyAfter = await hburn.totalSupply();
+        expect(supplyBefore - supplyAfter).to.equal(feeHburn);
       });
     });
 
@@ -765,7 +770,7 @@ describe("🔥 HellBurn Protocol — Full Test Suite (Trustless v4.0)", function
 
     it("rejects zero slippage (C-02)", async function () {
       await deployer.sendTransaction({ to: await buyBurn.getAddress(), value: ethers.parseEther("1") });
-      await expect(buyBurn.executeBuyAndBurn(0))
+      await expect(buyBurn.executeBuyAndBurn(0, FAR_FUTURE))
         .to.be.revertedWithCustomError(buyBurn, "ZeroSlippage");
     });
   });
@@ -808,7 +813,7 @@ describe("🔥 HellBurn Protocol — Full Test Suite (Trustless v4.0)", function
 
       // 3. End genesis → LP created
       await time.increase(29 * DAY);
-      await expect(genesis.endGenesis(0))
+      await expect(genesis.endGenesis(1, FAR_FUTURE))
         .to.emit(genesis, "LiquidityPoolCreated");
 
       // 4. Stake treasury → TitanX locked for 3500 days

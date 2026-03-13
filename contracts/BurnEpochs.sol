@@ -171,6 +171,9 @@ contract BurnEpochs is ReentrancyGuard {
         uint256 start = nextEpochToFinalize;
         uint256 totalBuyBurn = 0;
 
+        // slither-disable-next-line costly-loop
+        // Rationale: storage writes inside loop are unavoidable for sequential finalization.
+        // Caller bounds the loop by choosing epochId; gas risk is caller's responsibility.
         for (uint256 i = start; i <= epochId; i++) {
             Epoch storage epoch = epochs[i];
             if (!_isEpochEnded(i)) break;  // stop at first non-ended epoch

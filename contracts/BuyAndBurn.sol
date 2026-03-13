@@ -5,11 +5,7 @@ import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "./interfaces/ISwapRouter.sol";
-
-/// @dev Minimal interface to call burn() on ERC20Burnable tokens
-interface IERC20Burnable {
-    function burn(uint256 amount) external;
-}
+import "./interfaces/IERC20Burnable.sol";
 
 /**
  * @title BuyAndBurn
@@ -105,6 +101,9 @@ contract BuyAndBurn is ReentrancyGuard {
         uint256 burnAmount = hburn.balanceOf(address(this));
         IERC20Burnable(address(hburn)).burn(burnAmount);
 
+        // slither-disable-next-line reentrancy-benign
+        // Rationale: nonReentrant guards this function. weth and swapRouter are immutable
+        // trusted addresses. totalETHUsed/totalHBURNBurned are informational counters only.
         totalETHUsed += ethBalance;
         totalHBURNBurned += burnAmount;
 

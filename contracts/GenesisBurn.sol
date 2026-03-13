@@ -7,6 +7,7 @@ import "@openzeppelin/contracts/utils/math/Math.sol";
 import "./interfaces/ITitanX.sol";
 import "./interfaces/ISwapRouter.sol";
 import "./interfaces/INonfungiblePositionManager.sol";
+import "./interfaces/IERC20Burnable.sol";
 import "./HellBurnToken.sol";
 
 /**
@@ -195,25 +196,22 @@ contract GenesisBurn is ReentrancyGuard {
         uint256 immediateAmount = (userAmount * IMMEDIATE_PERCENT) / 100;
         uint256 vestedAmount = userAmount - immediateAmount;
 
-        // Mint LP reserve to this contract
-        hburn.mint(address(this), lpAmount);
+        // ── CEI: all state changes BEFORE external mint calls ────────
         lpReserveHBURN += lpAmount;
+        totalTitanXBurned += titanXAmount;
+        totalHBURNMinted += hburnAmount;
 
-        // Mint immediate portion to user
-        hburn.mint(msg.sender, immediateAmount);
-
-        // Mint vested portion to this contract
-        hburn.mint(address(this), vestedAmount);
-
-        // [H-01] Record as separate vesting tranche
+        // [H-01] Record vesting tranche before any external calls
         vestingTranches[msg.sender].push(VestingTranche({
             amount: vestedAmount,
             vestingStart: block.timestamp,
             claimed: 0
         }));
 
-        totalTitanXBurned += titanXAmount;
-        totalHBURNMinted += hburnAmount;
+        // ── External calls (minting) last ────────────────────────────
+        hburn.mint(address(this), lpAmount);
+        hburn.mint(msg.sender, immediateAmount);
+        hburn.mint(address(this), vestedAmount);
 
         emit GenesisBurnExecuted(
             msg.sender, titanXAmount, hburnAmount,
@@ -478,6 +476,7 @@ contract GenesisBurn is ReentrancyGuard {
             sqrtPriceX96 = _calculateSqrtPriceX96(wethReceived, hburnForLP);
         }
 
+        // slither-disable-next-line unused-return — pool address not needed; contract is immutable
         positionManager.createAndInitializePoolIfNecessary(
             hburnIsToken0 ? address(hburn) : address(weth),
             hburnIsToken0 ? address(weth) : address(hburn),
@@ -505,6 +504,9 @@ contract GenesisBurn is ReentrancyGuard {
             })
         );
 
+        // slither-disable-next-line reentrancy-benign
+        // Rationale: endGenesis() sets genesisEnded=true as first action (CEI).
+        // positionManager is an immutable trusted address. nonReentrant guards endGenesis().
         lpTokenId = tokenId;
         lpCreated = true;
 

@@ -5,11 +5,7 @@ import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "./interfaces/ITitanX.sol";
-
-/// @dev Minimal interface to call burn() on ERC20Burnable tokens
-interface IERC20Burnable {
-    function burn(uint256 amount) external;
-}
+import "./interfaces/IERC20Burnable.sol";
 
 /**
  * @title HellBurnStaking
@@ -170,17 +166,18 @@ contract HellBurnStaking is ReentrancyGuard {
             uint256 penaltyPct = (100 - maturityPct) * 2;
             penalty = (s.amount * penaltyPct) / 100;
             amountReturned = s.amount - penalty;
-
-            if (penalty > 0) {
-                // [M-03][M-05] Burn 100% of penalty via burn() so totalSupply decreases
-                IERC20Burnable(address(hburn)).burn(penalty);
-                emit PenaltyDistributed(penalty, 0);
-            }
         }
 
-        // [I-03] Only count fully matured exits toward loyalty / reStake eligibility
+        // [I-03] CEI: increment completedStakes BEFORE any external calls
         if (maturityPct >= 100) {
             completedStakes[msg.sender]++;
+        }
+
+        // External calls last
+        if (penalty > 0) {
+            // [M-03][M-05] Burn 100% of penalty via burn() so totalSupply decreases
+            IERC20Burnable(address(hburn)).burn(penalty);
+            emit PenaltyDistributed(penalty, 0);
         }
 
         // Return HBURN
@@ -288,6 +285,9 @@ contract HellBurnStaking is ReentrancyGuard {
         if (s.fuelBonus >= MAX_FUEL_BONUS) revert FuelMaxReached();
 
         // Burn the token
+        // slither-disable-next-line reentrancy-no-eth,reentrancy-benign
+        // Rationale: addFuelTitanX/addFuelDragonX are both nonReentrant.
+        // TitanX and DragonX are immutable trusted addresses with no reentrant callbacks.
         if (token == address(titanX)) {
             bool success = titanX.transferFrom(msg.sender, DEAD_ADDRESS, amount);
             if (!success) revert TransferFailed();
