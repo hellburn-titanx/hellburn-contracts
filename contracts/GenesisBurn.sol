@@ -3,6 +3,7 @@ pragma solidity ^0.8.24;
 
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import "@openzeppelin/contracts/utils/math/Math.sol";
 import "./interfaces/ITitanX.sol";
 import "./interfaces/ISwapRouter.sol";
 import "./interfaces/INonfungiblePositionManager.sol";
@@ -12,22 +13,19 @@ import "./HellBurnToken.sol";
  * @title GenesisBurn (Fair Launch Edition)
  * @notice 28-day genesis phase: users burn TitanX to mint HBURN.
  *
- * FAIR LAUNCH MECHANISM:
- *   - 3% of all minted HBURN goes to an LP reserve (held by this contract)
- *   - 8% of incoming TitanX (Genesis Fund) is accumulated in this contract
- *   - At endGenesis(), the contract:
- *     1. Swaps accumulated TitanX → WETH via Uniswap V3
- *     2. Creates a full-range HBURN/WETH Uniswap V3 LP position
- *     3. LP-NFT is permanently locked in this contract (no admin access)
- *   - The initial HBURN price is determined automatically:
- *     price = WETH_received / LP_HBURN_reserve
- *   - No insider tokens, no pre-mine, fully trustless
- *
  * AUDIT FIXES v2:
  *   [H-01] Per-tranche vesting — each burn starts its own 28-day vest
  *   [M-03] Max supply cap enforced
  *   [L-01] Zero-address checks
  *   [L-04] Corrected error semantics
+ *
+ * AUDIT FIXES v3 (SpyWolf):
+ *   [H-02] _calculateSqrtPriceX96 uses single-sqrt (OZ Math.mulDiv) — no double truncation
+ *   [H-03] MIN_BURN_AMOUNT enforced; claimVestedPaged() added for gas-safe claiming
+ *   [M-01] minWETHOut > 0 enforced in endGenesis
+ *   [M-02] Caller-supplied deadline flows through endGenesis → swap and LP mint
+ *   [M-05] hburn.burn() used instead of safeTransfer(DEAD_ADDRESS) in collectLPFees
+ *   [I-04] onERC721Received validates sender is positionManager
  */
 contract GenesisBurn is ReentrancyGuard {
     using SafeERC20 for IERC20;
@@ -55,6 +53,9 @@ contract GenesisBurn is ReentrancyGuard {
     // [M-03] Max supply cap
     uint256 public constant MAX_HBURN_SUPPLY = 1_000_000_000_000 ether; // 1 trillion
 
+    // [H-03] Minimum burn to prevent tranche array bloat / gas griefing
+    uint256 public constant MIN_BURN_AMOUNT = 1e18; // 1 full TitanX token
+
     address public constant DEAD_ADDRESS = 0x000000000000000000000000000000000000dEaD;
 
     // Uniswap V3 constants
@@ -66,7 +67,7 @@ contract GenesisBurn is ReentrancyGuard {
     // ─── Immutables ──────────────────────────────────────────────────
     ITitanX public immutable titanX;
     address public immutable dragonXVault;
-    address public immutable treasury;
+    address public immutable buyAndBurn;
     HellBurnToken public immutable hburn;
 
     // Uniswap
@@ -91,6 +92,10 @@ contract GenesisBurn is ReentrancyGuard {
     uint256 public lpTokenId;            // Uniswap V3 NFT position ID
     bool public lpCreated;
 
+    // Treasury auto-stake state (22% TitanX — fully trustless)
+    uint256 public treasuryTitanX;       // TitanX accumulated from 22% fee
+    bool public treasuryStaked;          // Whether treasury has been staked
+
     // [H-01] Per-tranche vesting
     struct VestingTranche {
         uint256 amount;
@@ -113,6 +118,8 @@ contract GenesisBurn is ReentrancyGuard {
         uint256 liquidity
     );
     event LPFeesCollected(uint256 hburnBurned, uint256 wethToBuyBurn);
+    event TreasuryStaked(uint256 titanXAmount, uint256 numDays);
+    event TreasuryYieldClaimed(uint256 ethAmount);
 
     // ─── Errors ──────────────────────────────────────────────────────
     error GenesisNotStarted();
@@ -125,26 +132,28 @@ contract GenesisBurn is ReentrancyGuard {
     error LPAlreadyCreated();
     error LPNotCreated();
     error InsufficientLiquidity();
+    error TreasuryAlreadyStaked();
+    error NothingToStake();
 
     // ─── Constructor ─────────────────────────────────────────────────
     constructor(
         address _titanX,
         address _dragonXVault,
-        address _treasury,
         address _hburn,
         address _swapRouter,
         address _positionManager,
         address _weth,
-        uint24 _titanXWethPoolFee
+        uint24 _titanXWethPoolFee,
+        address _buyAndBurn
     ) {
         require(_titanX != address(0) && _dragonXVault != address(0), "zero addr");
-        require(_treasury != address(0) && _hburn != address(0), "zero addr");
+        require(_hburn != address(0) && _buyAndBurn != address(0), "zero addr");
         require(_swapRouter != address(0) && _positionManager != address(0), "zero addr");
         require(_weth != address(0), "zero addr");
 
         titanX = ITitanX(_titanX);
         dragonXVault = _dragonXVault;
-        treasury = _treasury;
+        buyAndBurn = _buyAndBurn;
         hburn = HellBurnToken(_hburn);
 
         swapRouter = ISwapRouter(_swapRouter);
@@ -164,6 +173,8 @@ contract GenesisBurn is ReentrancyGuard {
         if (block.timestamp < genesisStart) revert GenesisNotStarted();
         if (block.timestamp > genesisEnd || genesisEnded) revert GenesisAlreadyEnded();
         if (titanXAmount == 0) revert ZeroAmount();
+        // [H-03] Enforce minimum to prevent vesting tranche array bloat / gas griefing
+        require(titanXAmount >= MIN_BURN_AMOUNT, "burn: below minimum 1 TitanX");
 
         // Transfer TitanX from user
         IERC20(address(titanX)).safeTransferFrom(msg.sender, address(this), titanXAmount);
@@ -229,6 +240,34 @@ contract GenesisBurn is ReentrancyGuard {
         emit VestingClaimed(msg.sender, totalClaimable);
     }
 
+    /**
+     * @notice [H-03] Paginated vesting claim — prevents gas griefing on large tranche arrays.
+     *         Process `count` tranches starting at `startIdx`.
+     *         Call repeatedly until all tranches are processed.
+     * @param startIdx First tranche index to process (0-based)
+     * @param count    Number of tranches to process in this call
+     */
+    function claimVestedPaged(uint256 startIdx, uint256 count) external nonReentrant {
+        VestingTranche[] storage tranches = vestingTranches[msg.sender];
+        uint256 end = startIdx + count;
+        if (end > tranches.length) end = tranches.length;
+        require(startIdx < end, "no tranches in range");
+
+        uint256 totalClaimable = 0;
+        for (uint256 i = startIdx; i < end; i++) {
+            uint256 trancheClaimable = _trancheClaimable(tranches[i]);
+            if (trancheClaimable > 0) {
+                tranches[i].claimed += trancheClaimable;
+                totalClaimable += trancheClaimable;
+            }
+        }
+
+        if (totalClaimable == 0) revert NothingToClaim();
+
+        IERC20(address(hburn)).safeTransfer(msg.sender, totalClaimable);
+        emit VestingClaimed(msg.sender, totalClaimable);
+    }
+
     // ═════════════════════════════════════════════════════════════════
     // ═══ FAIR LAUNCH: End Genesis + Create LP (Trustless) ═══════════
     // ═════════════════════════════════════════════════════════════════
@@ -240,12 +279,18 @@ contract GenesisBurn is ReentrancyGuard {
      *         The LP-NFT is permanently locked in this contract.
      *         No admin, no owner, no withdraw function exists.
      *
-     * @param minWETHOut Minimum WETH from TitanX swap (MEV protection).
-     *                   Frontend should use a quote or TWAP for this value.
+     * @param minWETHOut Minimum WETH from TitanX swap (MEV protection, MUST be > 0).
+     *                   Use an off-chain quote or TWAP to calculate a safe value.
+     * @param deadline   Unix timestamp after which the swap/LP tx reverts.
+     *                   Set off-chain: Math.floor(Date.now()/1000) + 300
      */
-    function endGenesis(uint256 minWETHOut) external nonReentrant {
+    function endGenesis(uint256 minWETHOut, uint256 deadline) external nonReentrant {
         if (block.timestamp <= genesisEnd) revert GenesisNotYetEnded();
         if (genesisEnded) revert GenesisAlreadyEnded();
+        // [M-01] Enforce non-zero slippage protection
+        require(minWETHOut > 0, "endGenesis: minWETHOut must be > 0");
+        // [M-02] Deadline must be in the future (caller-supplied, not block.timestamp+N)
+        require(deadline > block.timestamp, "endGenesis: deadline expired");
 
         genesisEnded = true;
         hburn.endGenesisMinting();
@@ -255,7 +300,7 @@ contract GenesisBurn is ReentrancyGuard {
         // If nobody participated, skip LP creation
         if (genesisFundTitanX == 0 || lpReserveHBURN == 0) return;
 
-        _createLiquidityPool(minWETHOut);
+        _createLiquidityPool(minWETHOut, deadline);
     }
 
     // ─── Collect LP Fees (Public Good) ───────────────────────────────
@@ -264,12 +309,9 @@ contract GenesisBurn is ReentrancyGuard {
      *         HBURN fees → burned (dead address).
      *         WETH fees → sent to BuyAndBurn contract as ETH.
      *         Callable by anyone. No admin access to funds.
-     *
-     * @param buyAndBurn Address of BuyAndBurn contract to receive WETH fees
      */
-    function collectLPFees(address buyAndBurn) external nonReentrant {
+    function collectLPFees() external nonReentrant {
         if (!lpCreated) revert LPNotCreated();
-        require(buyAndBurn != address(0), "zero addr");
 
         (uint256 amount0, uint256 amount1) = positionManager.collect(
             INonfungiblePositionManager.CollectParams({
@@ -285,9 +327,9 @@ contract GenesisBurn is ReentrancyGuard {
         uint256 hburnFees = hburnIsToken0 ? amount0 : amount1;
         uint256 wethFees = hburnIsToken0 ? amount1 : amount0;
 
-        // Burn HBURN fees
+        // Burn HBURN fees — [M-05] use burn() so totalSupply decreases
         if (hburnFees > 0) {
-            IERC20(address(hburn)).safeTransfer(DEAD_ADDRESS, hburnFees);
+            hburn.burn(hburnFees);
         }
 
         // Send WETH fees → ETH → BuyAndBurn
@@ -298,6 +340,45 @@ contract GenesisBurn is ReentrancyGuard {
         }
 
         emit LPFeesCollected(hburnFees, wethFees);
+    }
+
+    // ─── Treasury Auto-Stake (Trustless) ─────────────────────────────
+    /**
+     * @notice Stakes ALL accumulated treasury TitanX for 3500 days.
+     *         Callable by anyone after genesis ends.
+     *         The stake generates ETH yield over time.
+     *         No one can withdraw the staked TitanX — it's locked for 3500 days.
+     */
+    function stakeTreasury() external nonReentrant {
+        if (!genesisEnded) revert GenesisNotYetEnded();
+        if (treasuryStaked) revert TreasuryAlreadyStaked();
+        if (treasuryTitanX == 0) revert NothingToStake();
+
+        treasuryStaked = true;
+        uint256 amount = treasuryTitanX;
+
+        // Approve TitanX to itself for staking (required by some implementations)
+        IERC20(address(titanX)).forceApprove(address(titanX), amount);
+        titanX.startStake(amount, 3500);
+
+        emit TreasuryStaked(amount, 3500);
+    }
+
+    /**
+     * @notice Claims accumulated ETH yield from the treasury TitanX stake
+     *         and forwards ALL to BuyAndBurn (buys HBURN + burns it).
+     *         Callable by anyone. No admin. Fully permissionless.
+     */
+    function claimTreasuryYield() external nonReentrant {
+        uint256 balBefore = address(this).balance;
+        titanX.claimUserAvailableETHPayouts();
+        uint256 claimed = address(this).balance - balBefore;
+
+        if (claimed > 0) {
+            (bool sent,) = buyAndBurn.call{value: claimed}("");
+            if (!sent) revert TransferFailed();
+            emit TreasuryYieldClaimed(claimed);
+        }
     }
 
     // ─── Views ───────────────────────────────────────────────────────
@@ -336,6 +417,13 @@ contract GenesisBurn is ReentrancyGuard {
         return (lpCreated, lpTokenId, lpReserveHBURN, genesisFundTitanX);
     }
 
+    /// @notice Returns treasury auto-stake status
+    function treasuryInfo() external view returns (
+        uint256 titanXAmount, bool staked
+    ) {
+        return (treasuryTitanX, treasuryStaked);
+    }
+
     // ─── Internal ────────────────────────────────────────────────────
     function _distributeTitanX(uint256 amount) internal {
         uint256 burnAmount = (amount * BURN_PERCENT) / 100;
@@ -349,14 +437,14 @@ contract GenesisBurn is ReentrancyGuard {
         titan.safeTransfer(DEAD_ADDRESS, burnAmount);
         // 35% DragonX vault
         titan.safeTransfer(dragonXVault, dragonAmount);
-        // 22% treasury (3500-day stake)
-        titan.safeTransfer(treasury, treasuryAmount);
+        // 22% treasury — stays in contract for auto-stake (trustless)
+        treasuryTitanX += treasuryAmount;
 
         // 8% Genesis Fund — stays in this contract for LP creation
         genesisFundTitanX += genesisAmount;
     }
 
-    function _createLiquidityPool(uint256 minWETHOut) internal {
+    function _createLiquidityPool(uint256 minWETHOut, uint256 deadline) internal {
         // ── Step 1: Swap Genesis Fund TitanX → WETH ──────────────────
         uint256 titanXBalance = genesisFundTitanX;
         IERC20(address(titanX)).forceApprove(address(swapRouter), titanXBalance);
@@ -367,7 +455,7 @@ contract GenesisBurn is ReentrancyGuard {
                 tokenOut: address(weth),
                 fee: titanXWethPoolFee,
                 recipient: address(this),
-                deadline: block.timestamp + 300,
+                deadline: deadline,      // [M-02] caller-supplied deadline
                 amountIn: titanXBalance,
                 amountOutMinimum: minWETHOut,
                 sqrtPriceLimitX96: 0
@@ -413,7 +501,7 @@ contract GenesisBurn is ReentrancyGuard {
                 amount0Min: 0,    // First LP sets the price — accept any ratio
                 amount1Min: 0,
                 recipient: address(this), // LP-NFT permanently locked here
-                deadline: block.timestamp + 300
+                deadline: deadline        // [M-02] caller-supplied deadline
             })
         );
 
@@ -424,41 +512,23 @@ contract GenesisBurn is ReentrancyGuard {
     }
 
     /**
-     * @dev Calculates sqrtPriceX96 = sqrt(amount1/amount0) * 2^96
-     *      Uses a simplified integer sqrt approach safe for on-chain use.
-     *      amount0 = token0 reserve, amount1 = token1 reserve
+     * @dev [H-02] Calculates sqrtPriceX96 = sqrt(amount1/amount0) * 2^96
+     *      Uses a single integer sqrt on a scaled value to avoid double-truncation
+     *      error from independently computing sqrt(amount1) and sqrt(amount0).
+     *
+     *      Correct formula: sqrt(amount1 * 2^192 / amount0)
+     *      We compute this as sqrt(Math.mulDiv(amount1, 1<<192, amount0))
+     *      which keeps full precision before the single truncating sqrt.
      */
     function _calculateSqrtPriceX96(uint256 amount0, uint256 amount1)
         internal pure returns (uint160)
     {
-        // price = amount1 / amount0
-        // sqrtPrice = sqrt(amount1 / amount0) = sqrt(amount1) / sqrt(amount0)
-        // sqrtPriceX96 = sqrtPrice * 2^96
-
-        // To maintain precision: sqrt(amount1 * 2^192 / amount0)
-        // = sqrt(amount1 * 2^192) / sqrt(amount0)
-        // But this overflows for large numbers, so we use:
-        // sqrtPriceX96 = sqrt(amount1) * 2^96 / sqrt(amount0)
-
-        uint256 sqrtAmount1 = _sqrt(amount1);
-        uint256 sqrtAmount0 = _sqrt(amount0);
-
-        require(sqrtAmount0 > 0, "zero amount0");
-
-        // Multiply by 2^96 before dividing to maintain precision
-        return uint160((sqrtAmount1 * (1 << 96)) / sqrtAmount0);
-    }
-
-    /// @dev Babylonian square root
-    function _sqrt(uint256 x) internal pure returns (uint256) {
-        if (x == 0) return 0;
-        uint256 z = (x + 1) / 2;
-        uint256 y = x;
-        while (z < y) {
-            y = z;
-            z = (x / z + z) / 2;
-        }
-        return y;
+        require(amount0 > 0, "zero amount0");
+        // Scale amount1 by 2^192 before dividing by amount0, then take single sqrt.
+        // Math.mulDiv handles the intermediate overflow safely.
+        uint256 ratioX192 = Math.mulDiv(amount1, 1 << 192, amount0);
+        uint256 sqrtRatioX96 = Math.sqrt(ratioX192);
+        return uint160(sqrtRatioX96);
     }
 
     function _calculateMintAmount(uint256 titanXAmount)
@@ -507,9 +577,11 @@ contract GenesisBurn is ReentrancyGuard {
     }
 
     // ─── ERC721 Receiver (required to hold Uniswap V3 LP NFT) ───────
+    // [I-04] Validate that the NFT comes from the NonfungiblePositionManager only
     function onERC721Received(address, address, uint256, bytes calldata)
-        external pure returns (bytes4)
+        external view returns (bytes4)
     {
+        require(msg.sender == address(positionManager), "only positionManager NFTs accepted");
         return this.onERC721Received.selector;
     }
 }

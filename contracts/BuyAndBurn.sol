@@ -6,6 +6,11 @@ import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "./interfaces/ISwapRouter.sol";
 
+/// @dev Minimal interface to call burn() on ERC20Burnable tokens
+interface IERC20Burnable {
+    function burn(uint256 amount) external;
+}
+
 /**
  * @title BuyAndBurn
  * @notice Receives ETH, buys HBURN on Uniswap V3, and permanently burns it.
@@ -14,12 +19,15 @@ import "./interfaces/ISwapRouter.sol";
  * AUDIT FIXES v2:
  *   [C-02] Removed zero-slippage function. All swaps require minHBURNOut.
  *   [L-01] Zero-address checks in constructor.
+ *
+ * AUDIT FIXES v3 (SpyWolf):
+ *   [M-02] Caller-supplied deadline — swap no longer uses block.timestamp+N (no protection)
+ *   [M-05] hburn.burn() used instead of safeTransfer(DEAD_ADDRESS) — totalSupply decreases
  */
 contract BuyAndBurn is ReentrancyGuard {
     using SafeERC20 for IERC20;
 
     // ─── Constants ───────────────────────────────────────────────────
-    address public constant DEAD_ADDRESS = 0x000000000000000000000000000000000000dEaD;
     uint24 public constant POOL_FEE = 10000;  // 1% fee tier
     uint256 public constant MIN_BUY_AMOUNT = 0.001 ether;
 
@@ -63,10 +71,14 @@ contract BuyAndBurn is ReentrancyGuard {
      *         Caller MUST provide a minimum output to prevent sandwich attacks.
      *         Use a frontend with TWAP oracle or off-chain quote for minHBURNOut.
      * @param minHBURNOut Minimum HBURN to receive (MEV protection, MUST be > 0)
+     * @param deadline    Unix timestamp — reverts if tx is mined after this time.
+     *                    Set off-chain: Math.floor(Date.now()/1000) + 300
      */
-    function executeBuyAndBurn(uint256 minHBURNOut) external nonReentrant {
+    function executeBuyAndBurn(uint256 minHBURNOut, uint256 deadline) external nonReentrant {
         // [C-02] Enforce non-zero slippage protection
         if (minHBURNOut == 0) revert ZeroSlippage();
+        // [M-02] Caller-supplied deadline — block.timestamp+N provides no real protection
+        require(deadline > block.timestamp, "deadline expired");
 
         uint256 ethBalance = address(this).balance;
         if (ethBalance < MIN_BUY_AMOUNT) revert BelowMinimum();
@@ -82,16 +94,16 @@ contract BuyAndBurn is ReentrancyGuard {
                 tokenOut: address(hburn),
                 fee: POOL_FEE,
                 recipient: address(this),
-                deadline: block.timestamp + 300,
+                deadline: deadline,          // [M-02] real deadline
                 amountIn: ethBalance,
                 amountOutMinimum: minHBURNOut,
                 sqrtPriceLimitX96: 0
             })
         );
 
-        // Burn all bought HBURN
+        // [M-05] Burn via burn() so totalSupply decreases, not dead-address accumulation
         uint256 burnAmount = hburn.balanceOf(address(this));
-        hburn.safeTransfer(DEAD_ADDRESS, burnAmount);
+        IERC20Burnable(address(hburn)).burn(burnAmount);
 
         totalETHUsed += ethBalance;
         totalHBURNBurned += burnAmount;

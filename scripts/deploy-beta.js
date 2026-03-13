@@ -163,13 +163,14 @@ async function main() {
 
     // 1. Mock Tokens
     console.log("  [1/7] Mock TitanX...");
-    const MockERC20 = await ethers.getContractFactory("MockERC20");
-    const titanX = await MockERC20.deploy("TitanX", "TITANX");
+    const MockTitanX = await ethers.getContractFactory("MockTitanX");
+    const titanX = await MockTitanX.deploy();
     await titanX.waitForDeployment();
     const titanXAddr = await titanX.getAddress();
     console.log(`        ✅ ${titanXAddr}`);
 
     console.log("  [2/7] Mock DragonX...");
+    const MockERC20 = await ethers.getContractFactory("MockERC20");
     const dragonX = await MockERC20.deploy("DragonX", "DRAGONX");
     await dragonX.waitForDeployment();
     const dragonXAddr = await dragonX.getAddress();
@@ -203,43 +204,41 @@ async function main() {
     const tokenDeployed = await token.getAddress();
     console.log(`        ✅ ${tokenDeployed}`);
 
-    // 5. GenesisBurn (Fair Launch: 8 params)
-    console.log("  [5/7] GenesisBurn (12h duration, Fair Launch)...");
+    // 5. GenesisBurn (Trustless — 8 params)
+    console.log("  [5/7] GenesisBurn (12h duration, Trustless)...");
     const GenesisBurn = await ethers.getContractFactory("GenesisBurn");
-    // On Sepolia: swapRouter, positionManager, weth use deployer as placeholder
-    // LP creation only works on mainnet with real Uniswap V3 contracts
     const genesis = await GenesisBurn.deploy(
       titanXAddr,           // _titanX
       deployer.address,     // _dragonXVault
-      deployer.address,     // _treasury
       tokenDeployed,        // _hburn
       deployer.address,     // _swapRouter (placeholder on testnet)
       deployer.address,     // _positionManager (placeholder on testnet)
       deployer.address,     // _weth (placeholder on testnet)
-      3000                  // _titanXWethPoolFee (0.3%)
+      3000,                 // _titanXWethPoolFee
+      buyBurnDeployed       // _buyAndBurn
     );
     await genesis.waitForDeployment();
     const genesisDeployed = await genesis.getAddress();
     console.log(`        ✅ ${genesisDeployed}`);
 
-    // 6. Staking
-    console.log("  [6/7] HellBurnStaking (min 1h)...");
+    // 6. Staking (no guardian — trustless)
+    console.log("  [6/7] HellBurnStaking (min 1h, no guardian)...");
     const Staking = await ethers.getContractFactory("HellBurnStaking");
     const staking = await Staking.deploy(
-      tokenDeployed, titanXAddr, dragonXAddr, deployer.address
+      tokenDeployed, titanXAddr, dragonXAddr
     );
     await staking.waitForDeployment();
     const stakingDeployed = await staking.getAddress();
     console.log(`        ✅ ${stakingDeployed}`);
 
-    // 7. BurnEpochs
+    // 7. BurnEpochs (no guardian — trustless)
     const block = await ethers.provider.getBlock("latest");
     const firstEpochStart = block.timestamp + 43500; // starts after genesis (12h + 5min buffer)
-    console.log("  [7/7] BurnEpochs (2h epochs)...");
+    console.log("  [7/7] BurnEpochs (2h epochs, no guardian)...");
     const BurnEpochs = await ethers.getContractFactory("BurnEpochs");
     const epochs = await BurnEpochs.deploy(
       titanXAddr, dragonXAddr, buyBurnDeployed, stakingDeployed,
-      firstEpochStart, deployer.address
+      firstEpochStart
     );
     await epochs.waitForDeployment();
     const epochsDeployed = await epochs.getAddress();
@@ -250,13 +249,13 @@ async function main() {
     console.log(`        Waiting ${VERIFY_DELAY_MS / 1000}s...\n`);
     await new Promise((r) => setTimeout(r, VERIFY_DELAY_MS));
 
-    await verify("Mock TitanX", titanXAddr, ["TitanX", "TITANX"]);
+    await verify("Mock TitanX", titanXAddr, []);
     await verify("Mock DragonX", dragonXAddr, ["DragonX", "DRAGONX"]);
     await verify("BuyAndBurn", buyBurnDeployed, [deployer.address, deployer.address, tokenDeployed]);
     await verify("HellBurnToken", tokenDeployed, [genesisDeployed, stakingDeployed, buyBurnDeployed]);
-    await verify("GenesisBurn", genesisDeployed, [titanXAddr, deployer.address, deployer.address, tokenDeployed, deployer.address, deployer.address, deployer.address, 3000]);
-    await verify("HellBurnStaking", stakingDeployed, [tokenDeployed, titanXAddr, dragonXAddr, deployer.address]);
-    await verify("BurnEpochs", epochsDeployed, [titanXAddr, dragonXAddr, buyBurnDeployed, stakingDeployed, firstEpochStart, deployer.address]);
+    await verify("GenesisBurn", genesisDeployed, [titanXAddr, deployer.address, tokenDeployed, deployer.address, deployer.address, deployer.address, 3000, buyBurnDeployed]);
+    await verify("HellBurnStaking", stakingDeployed, [tokenDeployed, titanXAddr, dragonXAddr]);
+    await verify("BurnEpochs", epochsDeployed, [titanXAddr, dragonXAddr, buyBurnDeployed, stakingDeployed, firstEpochStart]);
 
     // ═══ SUMMARY ═══
     const summary = {

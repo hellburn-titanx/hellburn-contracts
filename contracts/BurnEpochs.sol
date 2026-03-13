@@ -2,7 +2,6 @@
 pragma solidity ^0.8.24;
 
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
-import "@openzeppelin/contracts/utils/Pausable.sol";
 import "./interfaces/ITitanX.sol";
 
 /**
@@ -12,11 +11,14 @@ import "./interfaces/ITitanX.sol";
  * AUDIT FIXES v2:
  *   [C-01] Per-epoch ETH tracking instead of address(this).balance
  *   [H-02] Underflow guard on epochId == 0
- *   [M-02] Emergency pause (deposits only, not withdrawals)
  *   [M-04] SafeERC20 for DragonX transfers
  *   [M-05] Orphaned ETH rolls over to next epoch
+ *
+ * AUDIT FIXES v3 (SpyWolf):
+ *   [L-02] batchClaimRewards reverts when totalReward == 0 (no silent no-op)
+ *   [L-04] firstEpochStart validated to be >= block.timestamp in constructor
  */
-contract BurnEpochs is ReentrancyGuard, Pausable {
+contract BurnEpochs is ReentrancyGuard {
 
     // ─── Constants ───────────────────────────────────────────────────
     uint256 public constant EPOCH_DURATION = 8 days;
@@ -36,7 +38,6 @@ contract BurnEpochs is ReentrancyGuard, Pausable {
     address public immutable dragonX;
     address public immutable buyAndBurn;
     address public immutable treasury;
-    address public immutable guardian;
 
     uint256 public immutable firstEpochStart;
 
@@ -90,8 +91,8 @@ contract BurnEpochs is ReentrancyGuard, Pausable {
     error ZeroAmount();
     error NoBurnsInEpoch();
     error TransferFailed();
-    error OnlyGuardian();
     error EpochOutOfOrder();
+    error NothingToClaim();
 
     // ─── Constructor ─────────────────────────────────────────────────
     constructor(
@@ -99,18 +100,17 @@ contract BurnEpochs is ReentrancyGuard, Pausable {
         address _dragonX,
         address _buyAndBurn,
         address _treasury,
-        uint256 _firstEpochStart,
-        address _guardian
+        uint256 _firstEpochStart
     ) {
         require(_titanX != address(0) && _dragonX != address(0), "zero addr");
         require(_buyAndBurn != address(0) && _treasury != address(0), "zero addr");
-        require(_guardian != address(0), "zero addr");
+        // [L-04] Prevent misconfigured past timestamps from creating phantom epochs
+        require(_firstEpochStart >= block.timestamp, "firstEpochStart must be in the future");
 
         titanX = ITitanX(_titanX);
         dragonX = _dragonX;
         buyAndBurn = _buyAndBurn;
         treasury = _treasury;
-        guardian = _guardian;
         firstEpochStart = _firstEpochStart;
     }
 
@@ -119,23 +119,12 @@ contract BurnEpochs is ReentrancyGuard, Pausable {
         _recordETHDeposit(msg.value);
     }
 
-    // ─── Emergency Pause [M-02] ──────────────────────────────────────
-    function pause() external {
-        if (msg.sender != guardian) revert OnlyGuardian();
-        _pause();
-    }
-
-    function unpause() external {
-        if (msg.sender != guardian) revert OnlyGuardian();
-        _unpause();
-    }
-
     // ─── Core: Burn ──────────────────────────────────────────────────
-    function burnTitanX(uint256 amount) external nonReentrant whenNotPaused {
+    function burnTitanX(uint256 amount) external nonReentrant {
         _burn(address(titanX), amount, TITANX_WEIGHT);
     }
 
-    function burnDragonX(uint256 amount) external nonReentrant whenNotPaused {
+    function burnDragonX(uint256 amount) external nonReentrant {
         _burn(dragonX, amount, DRAGONX_WEIGHT);
     }
 
@@ -180,6 +169,8 @@ contract BurnEpochs is ReentrancyGuard, Pausable {
     /// @notice Finalize all pending epochs up to (and including) `epochId` in one tx
     function finalizeUpTo(uint256 epochId) external nonReentrant {
         uint256 start = nextEpochToFinalize;
+        uint256 totalBuyBurn = 0;
+
         for (uint256 i = start; i <= epochId; i++) {
             Epoch storage epoch = epochs[i];
             if (!_isEpochEnded(i)) break;  // stop at first non-ended epoch
@@ -196,17 +187,19 @@ contract BurnEpochs is ReentrancyGuard, Pausable {
                 uint256 buyBurnAmount = epochETH - rewardsForEpoch;
                 epoch.ethRewards = rewardsForEpoch;
                 totalETHDistributed += epoch.ethRewards;
-
-                if (buyBurnAmount > 0) {
-                    (bool sent,) = buyAndBurn.call{value: buyBurnAmount}("");
-                    if (!sent) revert TransferFailed();
-                }
+                totalBuyBurn += buyBurnAmount;
             } else if (epochETH > 0) {
                 carryOverETH = epochETH;
                 emit OrphanedETHCarriedOver(i, epochETH);
             }
 
             emit EpochFinalized(i, epoch.ethRewards, epoch.totalWeightedBurns);
+        }
+
+        // CEI: External call AFTER all state changes
+        if (totalBuyBurn > 0) {
+            (bool sent,) = buyAndBurn.call{value: totalBuyBurn}("");
+            if (!sent) revert TransferFailed();
         }
     }
 
@@ -248,10 +241,11 @@ contract BurnEpochs is ReentrancyGuard, Pausable {
             emit RewardsClaimed(msg.sender, epochIds[i], userShare);
         }
 
-        if (totalReward > 0) {
-            (bool sent,) = msg.sender.call{value: totalReward}("");
-            if (!sent) revert TransferFailed();
-        }
+        // [L-02] Revert when nothing was claimable — prevents silent no-op transactions
+        if (totalReward == 0) revert NothingToClaim();
+
+        (bool sent,) = msg.sender.call{value: totalReward}("");
+        if (!sent) revert TransferFailed();
     }
 
     // ─── Views ───────────────────────────────────────────────────────

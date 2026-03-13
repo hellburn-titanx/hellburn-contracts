@@ -2,10 +2,14 @@
 pragma solidity ^0.8.24;
 
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
-import "@openzeppelin/contracts/utils/Pausable.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "./interfaces/ITitanX.sol";
+
+/// @dev Minimal interface to call burn() on ERC20Burnable tokens
+interface IERC20Burnable {
+    function burn(uint256 amount) external;
+}
 
 /**
  * @title HellBurnStaking
@@ -16,10 +20,17 @@ import "./interfaces/ITitanX.sol";
  *   [H-04] Fuel recalculation preserves loyalty bonus
  *   [H-05] reStake requires prior completed stake
  *   [M-01] Penalty: 50% burned, 50% stays in contract as HBURN (benefits stakers via deflation)
- *   [M-02] Emergency pause (deposits only)
  *   [L-01] Zero-address checks
+ *
+ * AUDIT FIXES v3 (SpyWolf):
+ *   [C-01] _addFuel settles realizedETH before share changes; resets stakeETHDebt after
+ *   [H-01] unallocatedETH buffer prevents ETH loss when totalShares == 0
+ *   [L-03] Minimum fuel amount enforced (>= 1e18); dust floor removed
+ *   [M-03] 100% of penalty HBURN is burned; totalSupply decreases correctly
+ *   [M-05] burn() used instead of safeTransfer(DEAD_ADDRESS)
+ *   [I-03] completedStakes only increments on fully matured exits (maturityPct >= 100)
  */
-contract HellBurnStaking is ReentrancyGuard, Pausable {
+contract HellBurnStaking is ReentrancyGuard {
     using SafeERC20 for IERC20;
 
     // ─── Constants ───────────────────────────────────────────────────
@@ -37,15 +48,14 @@ contract HellBurnStaking is ReentrancyGuard, Pausable {
     uint256 public constant PHOENIX_BONUS = 1050;
     uint256 public constant PHOENIX_THRESHOLD = 3;
 
-    uint256 public constant PENALTY_BURN_PERCENT = 50;
-
+    // [M-05] PENALTY_BURN_PERCENT removed — 100% of penalty is now burned via burn()
+    // DEAD_ADDRESS kept for fuel token burns (TitanX/DragonX)
     address public constant DEAD_ADDRESS = 0x000000000000000000000000000000000000dEaD;
 
     // ─── Immutables ──────────────────────────────────────────────────
     IERC20 public immutable hburn;
     ITitanX public immutable titanX;
     address public immutable dragonX;
-    address public immutable guardian;
 
     // ─── Stake State ─────────────────────────────────────────────────
     struct Stake {
@@ -76,6 +86,10 @@ contract HellBurnStaking is ReentrancyGuard, Pausable {
     uint256 public totalETHReceived;
     uint256 public ethPerShare;
     mapping(uint256 => uint256) public stakeETHDebt;
+    // [C-01] Realized ETH per stake, settled before any share change
+    mapping(uint256 => uint256) public realizedETH;
+    // [H-01] ETH received when totalShares == 0; flushed on next stake creation
+    uint256 public unallocatedETH;
 
     // ─── Events ──────────────────────────────────────────────────────
     event StakeStarted(
@@ -103,16 +117,14 @@ contract HellBurnStaking is ReentrancyGuard, Pausable {
     error FuelMaxReached();
     error TransferFailed();
     error NoPriorStake();
-    error OnlyGuardian();
 
     // ─── Constructor ─────────────────────────────────────────────────
-    constructor(address _hburn, address _titanX, address _dragonX, address _guardian) {
+    constructor(address _hburn, address _titanX, address _dragonX) {
         require(_hburn != address(0) && _titanX != address(0), "zero addr");
-        require(_dragonX != address(0) && _guardian != address(0), "zero addr");
+        require(_dragonX != address(0), "zero addr");
         hburn = IERC20(_hburn);
         titanX = ITitanX(_titanX);
         dragonX = _dragonX;
-        guardian = _guardian;
     }
 
     // ─── Receive ETH ────────────────────────────────────────────────
@@ -124,24 +136,13 @@ contract HellBurnStaking is ReentrancyGuard, Pausable {
         _distributeETH(msg.value);
     }
 
-    // ─── Emergency Pause [M-02] ──────────────────────────────────────
-    function pause() external {
-        if (msg.sender != guardian) revert OnlyGuardian();
-        _pause();
-    }
-
-    function unpause() external {
-        if (msg.sender != guardian) revert OnlyGuardian();
-        _unpause();
-    }
-
     // ─── Start Stake ─────────────────────────────────────────────────
-    function startStake(uint256 amount, uint256 numDays) external nonReentrant whenNotPaused returns (uint256) {
+    function startStake(uint256 amount, uint256 numDays) external nonReentrant returns (uint256) {
         return _startStake(amount, numDays, false);
     }
 
     // [H-05] reStake requires at least one completed stake
-    function reStake(uint256 amount, uint256 numDays) external nonReentrant whenNotPaused returns (uint256) {
+    function reStake(uint256 amount, uint256 numDays) external nonReentrant returns (uint256) {
         if (completedStakes[msg.sender] == 0) revert NoPriorStake();
         return _startStake(amount, numDays, true);
     }
@@ -171,20 +172,16 @@ contract HellBurnStaking is ReentrancyGuard, Pausable {
             amountReturned = s.amount - penalty;
 
             if (penalty > 0) {
-                // [M-01] 50% burned permanently, 50% stays in contract
-                // (stays as HBURN backing — effectively benefits all holders)
-                uint256 burnPortion = (penalty * PENALTY_BURN_PERCENT) / 100;
-                uint256 keptPortion = penalty - burnPortion;
-
-                hburn.safeTransfer(DEAD_ADDRESS, burnPortion);
-                // keptPortion stays in contract — not transferred anywhere
-
-                emit PenaltyDistributed(burnPortion, keptPortion);
+                // [M-03][M-05] Burn 100% of penalty via burn() so totalSupply decreases
+                IERC20Burnable(address(hburn)).burn(penalty);
+                emit PenaltyDistributed(penalty, 0);
             }
         }
 
-        // [H-05] Track completed stakes for reStake validation
-        completedStakes[msg.sender]++;
+        // [I-03] Only count fully matured exits toward loyalty / reStake eligibility
+        if (maturityPct >= 100) {
+            completedStakes[msg.sender]++;
+        }
 
         // Return HBURN
         if (amountReturned > 0) {
@@ -201,11 +198,11 @@ contract HellBurnStaking is ReentrancyGuard, Pausable {
     }
 
     // ─── Fuel Mechanic ───────────────────────────────────────────────
-    function addFuelTitanX(uint256 stakeId, uint256 amount) external nonReentrant whenNotPaused {
+    function addFuelTitanX(uint256 stakeId, uint256 amount) external nonReentrant {
         _addFuel(stakeId, address(titanX), amount, 1);
     }
 
-    function addFuelDragonX(uint256 stakeId, uint256 amount) external nonReentrant whenNotPaused {
+    function addFuelDragonX(uint256 stakeId, uint256 amount) external nonReentrant {
         _addFuel(stakeId, dragonX, amount, DRAGONX_FUEL_WEIGHT);
     }
 
@@ -215,21 +212,18 @@ contract HellBurnStaking is ReentrancyGuard, Pausable {
     }
 
     function getStakeInfo(uint256 stakeId) external view returns (
-		uint256 amount, uint256 shares, uint256 startTime,
-		uint256 endTime, uint256 fuelBonus, bool active,
-		uint256 maturityPct, uint256 pendingETH_
-		) {
-			Stake storage s = stakes[stakeId];
-    
-		amount = s.amount;
-		shares = s.shares;
-		startTime = s.startTime;
-		endTime = s.endTime;
-		fuelBonus = s.fuelBonus;
-		active = s.active;
-		maturityPct = _maturityPercent(s);
-		pendingETH_ = s.active ? _pendingETH(stakeId) : 0;
-	}
+        uint256 amount, uint256 shares, uint256 startTime,
+        uint256 endTime, uint256 fuelBonus, bool active,
+        uint256 maturityPct, uint256 pendingETH_
+    ) {
+        Stake storage s = stakes[stakeId];
+        return (
+            s.amount, s.shares, s.startTime, s.endTime,
+            s.fuelBonus, s.active,
+            _maturityPercent(s),
+            s.active ? _pendingETH(stakeId) : 0
+        );
+    }
 
     function pendingETHReward(uint256 stakeId) external view returns (uint256) {
         return _pendingETH(stakeId);
@@ -273,11 +267,20 @@ contract HellBurnStaking is ReentrancyGuard, Pausable {
         totalShares += shares;
         stakeETHDebt[stakeId] = ethPerShare;
 
+        // [H-01] Flush any buffered ETH now that there is at least one active staker
+        if (unallocatedETH > 0) {
+            uint256 buffered = unallocatedETH;
+            unallocatedETH = 0;
+            ethPerShare += (buffered * 1e18) / totalShares;
+        }
+
         emit StakeStarted(msg.sender, stakeId, amount, shares, numDays, isRestake);
     }
 
     function _addFuel(uint256 stakeId, address token, uint256 amount, uint256 weight) internal {
         if (amount == 0) revert ZeroAmount();
+        // [L-03] Enforce meaningful minimum — dust burns waste gas and amplify C-01 attack surface
+        require(amount >= 1e18, "fuel: below minimum 1 token");
 
         Stake storage s = stakes[stakeId];
         if (!s.active) revert StakeNotActive();
@@ -292,9 +295,17 @@ contract HellBurnStaking is ReentrancyGuard, Pausable {
             _safeTransferFrom(token, msg.sender, DEAD_ADDRESS, amount);
         }
 
+        // [C-01] Settle pending ETH rewards BEFORE changing shares or debt.
+        //         This prevents retroactive inflation of pending rewards.
+        uint256 pending = _rawPendingETH(stakeId);
+        if (pending > 0) {
+            realizedETH[stakeId] += pending;
+        }
+
         // Calculate fuel increment
         uint256 fuelIncrement = (amount * weight) / 1e9;
-        if (fuelIncrement == 0) fuelIncrement = 1;
+        // [L-03] Remove dust floor — if increment rounds to zero, revert (amount too small)
+        require(fuelIncrement > 0, "fuel: increment rounds to zero");
 
         // Remove old shares, recalculate with new fuel
         totalShares -= s.shares;
@@ -308,21 +319,39 @@ contract HellBurnStaking is ReentrancyGuard, Pausable {
 
         totalShares += s.shares;
 
+        // [C-01] Reset debt so new shares only earn yield from THIS point forward
+        stakeETHDebt[stakeId] = ethPerShare;
+
         emit FuelAdded(msg.sender, stakeId, token, amount, s.fuelBonus);
     }
 
     function _distributeETH(uint256 amount) internal {
-        if (totalShares > 0 && amount > 0) {
-            ethPerShare += (amount * 1e18) / totalShares;
+        if (amount == 0) return;
+        if (totalShares > 0) {
+            // [H-01] If there is buffered ETH from a zero-staker window, flush it now
+            uint256 toDistribute = amount + unallocatedETH;
+            unallocatedETH = 0;
+            ethPerShare += (toDistribute * 1e18) / totalShares;
+            totalETHReceived += toDistribute;
+            emit ETHRewardsReceived(toDistribute);
+        } else {
+            // [H-01] No active stakers — buffer ETH to prevent permanent loss
+            unallocatedETH += amount;
             totalETHReceived += amount;
             emit ETHRewardsReceived(amount);
         }
     }
 
-    function _pendingETH(uint256 stakeId) internal view returns (uint256) {
+    // [C-01] Raw unrealized ETH (excludes already settled realizedETH)
+    function _rawPendingETH(uint256 stakeId) internal view returns (uint256) {
         Stake storage s = stakes[stakeId];
         if (!s.active || totalShares == 0) return 0;
         return (s.shares * (ethPerShare - stakeETHDebt[stakeId])) / 1e18;
+    }
+
+    // [C-01] Total pending ETH = settled realized + current unrealized
+    function _pendingETH(uint256 stakeId) internal view returns (uint256) {
+        return realizedETH[stakeId] + _rawPendingETH(stakeId);
     }
 
     function _timeBonus(uint256 numDays) internal pure returns (uint256) {
